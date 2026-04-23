@@ -18,7 +18,6 @@ from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from rich.table import Table
 from .utils import console
 
 logger = logging.getLogger(__name__)
@@ -174,31 +173,3 @@ def save_config(settings: Settings) -> None:
     with open(settings.config_file, "w") as f:
         json.dump(settings.to_persist_dict(), f, indent=2)
     logger.debug("Config saved to %s", settings.config_file)
-
-
-def display_config(settings: Settings) -> None:
-    """Pretty-print current configuration."""
-    table = Table(title="Current Configuration", show_header=True, header_style="bold cyan")
-    table.add_column("Setting", style="cyan", width=24)
-    table.add_column("Value", style="white")
-    table.add_column("Source", style="dim")
-
-    rows: list[tuple[str, str, str]] = [
-        ("api_key", f"{'*' * 8}{settings.api_key[-4:]}" if settings.api_key else "[red]NOT SET[/red]", "env"),
-        ("base_url", settings.base_url, "config"),
-        ("model", settings.model, "config"),
-        ("temperature", str(settings.temperature), "config"),
-        ("max_tokens", str(settings.max_tokens) if settings.max_tokens else "auto", "config"),
-        ("system_prompt", settings.system_prompt[:60] + ("…" if len(settings.system_prompt) > 60 else ""), "config"),
-        ("timeout", f"{settings.timeout}s", "config"),
-        ("context_window", str(settings.context_window), "config"),
-        ("theme", settings.theme, "config"),
-        ("mcp_file", str(settings.mcp_file), "config"),
-        ("config_file", str(settings.config_file), "—"),
-    ]
-
-    for name, value, source in rows:
-        table.add_row(name, value, source)
-
-    console.print(table)
-    console.print(f"\n[dim]Config file: {settings.config_file}[/dim]")

@@ -183,7 +183,6 @@ Type any command inside the chat prompt. Tab-completion is available.
 | `/tokens` | Show token usage |
 | `/temp [value]` | View or set temperature |
 | `/mcp` | Show MCP servers & tools |
-| `/config` | Show current configuration |
 | `/export [file]` | Export as Markdown |
 | `/multi` | Enter multi-line input mode |
 | `/exit` | Exit |

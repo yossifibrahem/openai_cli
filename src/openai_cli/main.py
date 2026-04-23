@@ -33,7 +33,6 @@ EXAMPLES
   ai -t 0.2                       Lower temperature (more focused)
   ai --base-url http://localhost:11434/v1   Use a local / Ollama endpoint
   ai --list-models                List available models and exit
-  ai --config                     Show current configuration and exit
   ai "What is 2+2?"               Single non-interactive message
 
 SLASH COMMANDS (inside the chat)
@@ -50,7 +49,6 @@ SLASH COMMANDS (inside the chat)
   /tokens                         Show token usage
   /temp [value]                   View or set temperature
   /mcp                            Show MCP servers & tools
-  /config                         Show configuration
   /export [file]                  Export as Markdown
   /multi                          Enter multi-line input mode
   /exit                           Exit
@@ -95,8 +93,6 @@ CONFIGURATION
                           help=f"Config file (default: ~/.config/openai-cli/config.json)")
     info_grp.add_argument("--list-models", action="store_true",
                           help="List available models and exit")
-    info_grp.add_argument("--config", action="store_true",
-                          help="Show current configuration and exit")
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_grp = parser.add_argument_group("Logging")
@@ -165,7 +161,7 @@ async def _interactive(settings: "Settings") -> None:  # noqa: F821
 
 def main() -> None:
     """CLI entry point — called by the ``ai`` script."""
-    from .config import load_config, display_config
+    from .config import load_config
     from .utils import console, setup_logging
 
     parser = _build_parser()
@@ -185,10 +181,6 @@ def main() -> None:
     # ── Non-interactive modes ─────────────────────────────────────────────────
     if args.list_models:
         asyncio.run(_list_models(settings))
-        return
-
-    if args.config:
-        display_config(settings)
         return
 
     if args.message:

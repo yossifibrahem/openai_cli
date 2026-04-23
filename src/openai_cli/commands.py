@@ -302,11 +302,6 @@ async def _cmd_mcp(ctx: CommandContext) -> None:
     ctx.session.mcp_manager.display_servers()
 
 
-async def _cmd_config(ctx: CommandContext) -> None:
-    from .config import display_config
-    display_config(ctx.session.settings)
-
-
 async def _cmd_export(ctx: CommandContext) -> None:
     """Export conversation as Markdown."""
     session = ctx.session
@@ -374,7 +369,6 @@ def build_registry() -> CommandRegistry:
         SlashCommand("tokens",    "Show token usage for this session",        "/tokens",              _cmd_tokens),
         SlashCommand("temp",      "View or set temperature",                  "/temp [value]",        _cmd_temp),
         SlashCommand("mcp",       "Show MCP servers and tools",               "/mcp",                 _cmd_mcp),
-        SlashCommand("config",    "Show current configuration",               "/config",              _cmd_config),
         SlashCommand("export",    "Export conversation as Markdown",          "/export [filename]",   _cmd_export),
         SlashCommand("multi",     "Enter multi-line input mode",              "/multi",               _cmd_multiline, aliases=["ml"]),
         SlashCommand("exit",      "Exit the application",                     "/exit",                _cmd_exit,      aliases=["quit", "q"]),
