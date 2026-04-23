@@ -4,7 +4,7 @@
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/ibrahim/Downloads/"],
       "env": {},
-      "enabled": true
+      "enabled": false
     },
     "brave-search": {
       "command": "npx",
