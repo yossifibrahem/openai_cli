@@ -131,7 +131,8 @@ async def _cmd_models(ctx: CommandContext) -> None:
 
 async def _cmd_clear(ctx: CommandContext) -> None:
     ctx.session.clear_history()
-    console.print("[green]✓[/green] Conversation history cleared.")
+    console.clear()
+    console.print(ctx.session._welcome_banner())
 
 
 async def _cmd_system(ctx: CommandContext) -> None:

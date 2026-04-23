@@ -1,11 +1,10 @@
-"""Model management — list and validate OpenAI models."""
+"""Model management — list and validate models."""
 
 from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
 
-from rich.table import Table
 from .utils import console
 
 if TYPE_CHECKING:
@@ -14,23 +13,6 @@ if TYPE_CHECKING:
     from .config import Settings
 
 logger = logging.getLogger(__name__)
-
-# Models known to support tool/function calling
-TOOL_CAPABLE_PREFIXES = ("gpt-4", "gpt-3.5-turbo", "o1", "o3", "o4")
-
-# Shorthand aliases users can type
-MODEL_ALIASES: dict[str, str] = {
-    "4o": "gpt-4o",
-    "4o-mini": "gpt-4o-mini",
-    "4": "gpt-4",
-    "4-turbo": "gpt-4-turbo",
-    "3.5": "gpt-3.5-turbo",
-    "o1": "o1",
-    "o1-mini": "o1-mini",
-    "o3": "o3",
-    "o3-mini": "o3-mini",
-    "o4-mini": "o4-mini",
-}
 
 
 class ModelManager:
@@ -49,71 +31,36 @@ class ModelManager:
             return self._cached_models
 
         if self._client is None:
-            return self._default_models()
+            return []
 
         try:
             page = await self._client.models.list()
-            ids = sorted(
-                (m.id for m in page.data if "gpt" in m.id or m.id.startswith(("o1", "o3", "o4"))),
-                key=lambda x: (0 if x.startswith("gpt-4o") else 1 if x.startswith("gpt-4") else 2, x),
-            )
-            self._cached_models = ids or self._default_models()
+            self._cached_models = sorted(m.id for m in page.data)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch model list: %s", exc)
-            self._cached_models = self._default_models()
 
         return self._cached_models
 
     async def list_and_display(self) -> None:
-        """Print a rich table of available models."""
+        """Print available models, marking the active one."""
         with console.status("[cyan]Fetching models…[/cyan]"):
             models = await self.list_models(force_refresh=True)
 
-        table = Table(title="Available Models", show_header=True, header_style="bold cyan")
-        table.add_column("Model ID", style="cyan")
-        table.add_column("Tools", justify="center")
-        table.add_column("Alias", style="dim")
+        if not models:
+            console.print("[yellow]No models returned by the API.[/yellow]")
+            return
 
-        # Build reverse alias map
-        rev_aliases: dict[str, str] = {v: k for k, v in MODEL_ALIASES.items()}
-
+        current = self._settings.model
         for model_id in models:
-            tools = "✓" if self._supports_tools(model_id) else "—"
-            alias = rev_aliases.get(model_id, "")
-            marker = " ← current" if model_id == self._settings.model else ""
-            table.add_row(model_id + marker, tools, alias)
-
-        console.print(table)
-        console.print(f"\n[dim]Current model: [bold]{self._settings.model}[/bold][/dim]")
-
-    def resolve_alias(self, name: str) -> str:
-        """Expand an alias like '4o' → 'gpt-4o'."""
-        return MODEL_ALIASES.get(name.lower(), name)
+            if model_id == current:
+                console.print(f"  [bold cyan]● {model_id}[/bold cyan]  [dim]← current[/dim]")
+            else:
+                console.print(f"  [dim]○[/dim] {model_id}")
 
     async def validate_model(self, name: str) -> str:
-        """Resolve alias and verify the model exists. Returns the final name."""
-        resolved = self.resolve_alias(name)
+        """Verify the model exists. Returns the name unchanged."""
         models = await self.list_models()
-        if resolved not in models:
+        if models and name not in models:
             # Soft warning — non-OpenAI deployments may have custom models
-            logger.warning("Model %r not in listed models (may still work)", resolved)
-        return resolved
-
-    @staticmethod
-    def _supports_tools(model_id: str) -> bool:
-        return any(model_id.startswith(p) for p in TOOL_CAPABLE_PREFIXES)
-
-    @staticmethod
-    def _default_models() -> list[str]:
-        """Fallback list when the API is unreachable or returns nothing."""
-        return [
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4-turbo",
-            "gpt-4",
-            "gpt-3.5-turbo",
-            "o1",
-            "o1-mini",
-            "o3-mini",
-            "o4-mini",
-        ]
+            logger.warning("Model %r not in listed models (may still work)", name)
+        return name
