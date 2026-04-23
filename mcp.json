@@ -17,6 +17,13 @@
     "remote-sse-server": {
       "url": "http://localhost:3001/sse",
       "enabled": false
+    },"exa": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.exa.ai/mcp"
+      ]
     }
   }
 }
