@@ -236,25 +236,32 @@ async def _cmd_history(ctx: CommandContext) -> None:
 async def _cmd_retry(ctx: CommandContext) -> None:
     """Re-send the last user message."""
     session = ctx.session
-    # Find last user message
-    last_user = None
-    for msg in reversed(session.history):
-        if msg["role"] == "user":
-            last_user = msg["content"]
-            break
-
+    last_user = _find_last_user_message(session.history)
     if last_user is None:
         console.print("[yellow]No previous user message to retry.[/yellow]")
         return
 
-    # Remove last assistant response if present
-    if session.history and session.history[-1]["role"] == "assistant":
-        session.history.pop()
-    if session.history and session.history[-1]["role"] == "user":
-        session.history.pop()
-
+    _strip_last_exchange(session.history)
     console.print(f"[dim]Retrying: {str(last_user)[:60]}…[/dim]")
     await session.send_message(str(last_user), from_retry=True)
+
+
+def _find_last_user_message(history: list[dict[str, Any]]) -> str | None:
+    """Find the last user message in history."""
+    for msg in reversed(history):
+        if msg["role"] == "user":
+            return str(msg.get("content", ""))
+    return None
+
+
+def _strip_last_exchange(history: list[dict[str, Any]]) -> None:
+    """Remove the last user/assistant exchange from history."""
+    if not history:
+        return
+    if history[-1]["role"] == "assistant":
+        history.pop()
+    if history and history[-1]["role"] == "user":
+        history.pop()
 
 
 async def _cmd_copy(ctx: CommandContext) -> None:

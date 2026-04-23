@@ -116,16 +116,16 @@ CONFIGURATION
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _apply_no_stream(args: argparse.Namespace) -> None:
+def _normalize_stream_arg(args: argparse.Namespace) -> None:
     """Inject stream=False into args namespace for config loader."""
     if getattr(args, "no_stream", False):
         args.stream = False  # type: ignore[attr-defined]
 
 
-def _apply_system(args: argparse.Namespace) -> None:
-    """Rename --system → system_prompt for config loader."""
-    if getattr(args, "system", None):
-        args.system_prompt = args.system  # type: ignore[attr-defined]
+def _normalize_system_arg(args: argparse.Namespace) -> None:
+    """Normalize --system to system_prompt for config loader."""
+    if (system := getattr(args, "system", None)) is not None:
+        args.system_prompt = system  # type: ignore[attr-defined]
 
 
 # ── Async entrypoints ─────────────────────────────────────────────────────────
@@ -170,8 +170,8 @@ def main() -> None:
     setup_logging(args.log_level, getattr(args, "log_file", None))
 
     # Normalise args before config loading
-    _apply_no_stream(args)
-    _apply_system(args)
+    _normalize_stream_arg(args)
+    _normalize_system_arg(args)
 
     try:
         settings = load_config(args)

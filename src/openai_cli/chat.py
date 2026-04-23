@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 import openai
 from openai import AsyncOpenAI
@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 # Maximum tool-call rounds per user message (prevents infinite loops)
 MAX_TOOL_ROUNDS = 6
+
+# Error messages mapped by exception type
+API_ERROR_MESSAGES: dict[type[openai.APIError], str] = {
+    openai.AuthenticationError: "Authentication failed. Check your API key.",
+    openai.RateLimitError: "Rate limit exceeded. Wait a moment and try again.",
+    openai.BadRequestError: "Bad request: {exc}",
+    openai.APIConnectionError: "Could not connect to the API. Check your network / base_url.",
+}
 
 # ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -161,28 +169,31 @@ class ChatSession:
 
         console.print()  # blank line before response
 
-        try:
-            response_text = await self._run_with_tools(messages, tools)
-        except openai.AuthenticationError:
-            render_error("Authentication failed. Check your API key.")
-            return None
-        except openai.RateLimitError:
-            render_error("Rate limit exceeded. Wait a moment and try again.")
-            return None
-        except openai.BadRequestError as exc:
-            render_error(f"Bad request: {exc}")
-            return None
-        except openai.APIConnectionError:
-            render_error("Could not connect to the API. Check your network / base_url.")
-            return None
-        except openai.APIStatusError as exc:
-            render_error(f"API error {exc.status_code}: {exc.message}")
-            return None
+        response_text = await self._execute_api_call(
+            lambda: self._run_with_tools(messages, tools)
+        )
 
         if response_text:
             self.history.append({"role": "assistant", "content": response_text})
 
         return response_text
+
+    async def _execute_api_call(
+        self, coro: Callable[[], Coroutine[Any, Any, str]]
+    ) -> str | None:
+        """Execute API call with consistent error mapping."""
+        try:
+            return await coro()
+        except openai.APIStatusError as exc:
+            render_error(f"API error {exc.status_code}: {exc.message}")
+            return None
+        except openai.APIError as exc:
+            msg = API_ERROR_MESSAGES.get(type(exc))
+            if msg:
+                render_error(msg.format(exc=exc) if "{exc}" in msg else msg)
+            else:
+                render_error(f"API error: {exc}")
+            return None
 
     # ── Streaming + tool loop ─────────────────────────────────────────────────
 
