@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/openai_cli/chat.py
+src/openai_cli/commands.py
+src/openai_cli/completer.py
+src/openai_cli/config.py
+src/openai_cli/main.py
+src/openai_cli/mcp_client.py
+src/openai_cli/models.py
+src/openai_cli/renderer.py
+src/openai_cli/utils.py
+src/openai_cli_chat.egg-info/PKG-INFO
+src/openai_cli_chat.egg-info/SOURCES.txt
+src/openai_cli_chat.egg-info/dependency_links.txt
+src/openai_cli_chat.egg-info/entry_points.txt
+src/openai_cli_chat.egg-info/requires.txt
+src/openai_cli_chat.egg-info/top_level.txt

@@ -1,0 +1,2 @@
+[console_scripts]
+ai = openai_cli.main:main
