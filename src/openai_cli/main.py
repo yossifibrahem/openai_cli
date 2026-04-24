@@ -15,7 +15,6 @@ except Exception:
     __version__ = "0.1.0"
 
 
-
 # ── Argument parser ───────────────────────────────────────────────────────────
 
 
@@ -90,7 +89,7 @@ CONFIGURATION
     # ── Config / info ─────────────────────────────────────────────────────────
     info_grp = parser.add_argument_group("Info & config")
     info_grp.add_argument("--config-file", type=Path, metavar="FILE",
-                          help=f"Config file (default: ~/.config/openai-cli/config.json)")
+                          help="Config file (default: ~/.config/openai-cli/config.json)")
     info_grp.add_argument("--list-models", action="store_true",
                           help="List available models and exit")
 
@@ -117,15 +116,14 @@ CONFIGURATION
 
 
 def _normalize_stream_arg(args: argparse.Namespace) -> None:
-    """Inject stream=False into args namespace for config loader."""
+    """Translate --no-stream flag into args.stream = False for config loader.
+
+    The config loader maps args.stream → Settings.stream (see _CLI_TO_SETTINGS
+    in config.py).  argparse only gives us ``no_stream=True``; we convert that
+    to an explicit ``stream=False`` so the mapping picks it up.
+    """
     if getattr(args, "no_stream", False):
         args.stream = False  # type: ignore[attr-defined]
-
-
-def _normalize_system_arg(args: argparse.Namespace) -> None:
-    """Normalize --system to system_prompt for config loader."""
-    if (system := getattr(args, "system", None)) is not None:
-        args.system_prompt = system  # type: ignore[attr-defined]
 
 
 # ── Async entrypoints ─────────────────────────────────────────────────────────
@@ -169,9 +167,8 @@ def main() -> None:
 
     setup_logging(args.log_level, getattr(args, "log_file", None))
 
-    # Normalise args before config loading
+    # Translate --no-stream into args.stream before config loading
     _normalize_stream_arg(args)
-    _normalize_system_arg(args)
 
     try:
         settings = load_config(args)

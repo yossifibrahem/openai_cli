@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from rich.table import Table
+
 from .utils import console
 
 if TYPE_CHECKING:
@@ -27,9 +28,9 @@ AsyncHandler = Callable[["CommandContext"], Coroutine[Any, Any, None]]
 
 @dataclass
 class SlashCommand:
-    name: str                      # e.g. "model"
+    name: str                       # e.g. "model"
     description: str
-    usage: str                     # e.g. "/model <name>"
+    usage: str                      # e.g. "/model <name>"
     handler: AsyncHandler
     aliases: list[str] = field(default_factory=list)
     completer_choices: list[str] = field(default_factory=list)  # dynamic — filled at runtime
@@ -38,7 +39,7 @@ class SlashCommand:
 @dataclass
 class CommandContext:
     session: "ChatSession"
-    args: str                      # everything after the command name
+    args: str                       # everything after the command name
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
@@ -247,7 +248,7 @@ async def _cmd_retry(ctx: CommandContext) -> None:
 
 
 def _find_last_user_message(history: list[dict[str, Any]]) -> str | None:
-    """Find the last user message in history."""
+    """Return the content of the last user message, or None."""
     for msg in reversed(history):
         if msg["role"] == "user":
             return str(msg.get("content", ""))
@@ -255,7 +256,7 @@ def _find_last_user_message(history: list[dict[str, Any]]) -> str | None:
 
 
 def _strip_last_exchange(history: list[dict[str, Any]]) -> None:
-    """Remove the last user/assistant exchange from history."""
+    """Remove the last user/assistant exchange from history in-place."""
     if not history:
         return
     if history[-1]["role"] == "assistant":
@@ -266,8 +267,7 @@ def _strip_last_exchange(history: list[dict[str, Any]]) -> None:
 
 async def _cmd_copy(ctx: CommandContext) -> None:
     """Copy last assistant response to clipboard."""
-    session = ctx.session
-    for msg in reversed(session.history):
+    for msg in reversed(ctx.session.history):
         if msg["role"] == "assistant":
             content = msg.get("content") or ""
             try:
@@ -336,13 +336,19 @@ async def _cmd_exit(ctx: CommandContext) -> None:
     raise SystemExit(0)
 
 
+async def _read_line_async(prompt: str) -> str:
+    """Read a single line from stdin without blocking the event loop."""
+    loop = asyncio.get_running_loop()  # ← correct; get_event_loop() is deprecated in 3.10+
+    return await loop.run_in_executor(None, input, prompt)
+
+
 async def _cmd_multiline(ctx: CommandContext) -> None:
     """Enter multi-line input mode (end with a line containing only '.')."""
     console.print("[dim]Multi-line mode: enter text, end with a single '.' on its own line.[/dim]")
     lines: list[str] = []
     while True:
         try:
-            line = await asyncio.get_event_loop().run_in_executor(None, input, "... ")
+            line = await _read_line_async("... ")
         except (EOFError, KeyboardInterrupt):
             break
         if line == ".":

@@ -4,23 +4,23 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, TypedDict
 
 import openai
 from openai import AsyncOpenAI
 
-from .utils import console
 from .mcp_client import MCPManager
 from .models import ModelManager
 from .renderer import (
     StreamingRenderer,
     render_error,
-    render_info,
+    render_message,
+    render_separator,
+    render_token_usage,
     render_tool_call,
     render_tool_result,
-    render_token_usage,
-    render_separator,
 )
+from .utils import console
 
 if TYPE_CHECKING:
     from .commands import CommandRegistry
@@ -31,17 +31,32 @@ logger = logging.getLogger(__name__)
 # Maximum tool-call rounds per user message (prevents infinite loops)
 MAX_TOOL_ROUNDS = 6
 
+
+# ── Types ─────────────────────────────────────────────────────────────────────
+
+
+class Message(TypedDict, total=False):
+    """A single chat message exchanged with the API."""
+
+    role: str
+    content: str | None
+    tool_calls: list[dict[str, Any]]
+    tool_call_id: str
+
+
+class TokenUsage(TypedDict):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 # Error messages mapped by exception type
-API_ERROR_MESSAGES: dict[type[openai.APIError], str] = {
+_API_ERROR_MESSAGES: dict[type[openai.APIError], str] = {
     openai.AuthenticationError: "Authentication failed. Check your API key.",
     openai.RateLimitError: "Rate limit exceeded. Wait a moment and try again.",
     openai.BadRequestError: "Bad request: {exc}",
     openai.APIConnectionError: "Could not connect to the API. Check your network / base_url.",
 }
-
-# ── Types ─────────────────────────────────────────────────────────────────────
-
-Message = dict[str, Any]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,17 +83,20 @@ class ChatSession:
 
     @property
     def registry(self) -> "CommandRegistry":
-        assert self._registry is not None, "Session not initialized"
+        if self._registry is None:
+            raise RuntimeError("ChatSession.initialize() must be called before use.")
         return self._registry
 
     @property
     def mcp_manager(self) -> MCPManager:
-        assert self._mcp is not None, "Session not initialized"
+        if self._mcp is None:
+            raise RuntimeError("ChatSession.initialize() must be called before use.")
         return self._mcp
 
     @property
     def model_manager(self) -> ModelManager:
-        assert self._model_manager is not None, "Session not initialized"
+        if self._model_manager is None:
+            raise RuntimeError("ChatSession.initialize() must be called before use.")
         return self._model_manager
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -97,7 +115,7 @@ class ChatSession:
         self._mcp = MCPManager(self.settings.mcp_file, disabled=self.settings.no_mcp)
         self._registry = build_registry()
 
-        # Initialize MCP — must happen before first send
+        # MCP must be initialized before the first send
         await self._mcp.initialize()
 
         # Populate model completer choices
@@ -158,7 +176,8 @@ class ChatSession:
 
     async def send_message(self, content: str, *, from_retry: bool = False) -> str | None:
         """Append user message to history, stream response, handle tool calls."""
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("ChatSession.initialize() must be called before sending messages.")
 
         if not from_retry:
             self.history.append({"role": "user", "content": content})
@@ -169,28 +188,24 @@ class ChatSession:
 
         console.print()  # blank line before response
 
-        response_text = await self._execute_api_call(
-            lambda: self._run_with_tools(messages, tools)
-        )
+        response_text = await self._execute_api_call(self._run_with_tools(messages, tools))
 
         if response_text:
             self.history.append({"role": "assistant", "content": response_text})
 
         return response_text
 
-    async def _execute_api_call(
-        self, coro: Callable[[], Coroutine[Any, Any, str]]
-    ) -> str | None:
-        """Execute API call with consistent error mapping."""
+    async def _execute_api_call(self, coro: Coroutine[Any, Any, str]) -> str | None:
+        """Await an API coroutine with consistent error mapping."""
         try:
-            return await coro()
+            return await coro
         except openai.APIStatusError as exc:
             render_error(f"API error {exc.status_code}: {exc.message}")
             return None
         except openai.APIError as exc:
-            msg = API_ERROR_MESSAGES.get(type(exc))
-            if msg:
-                render_error(msg.format(exc=exc) if "{exc}" in msg else msg)
+            template = _API_ERROR_MESSAGES.get(type(exc))
+            if template:
+                render_error(template.format(exc=exc) if "{exc}" in template else template)
             else:
                 render_error(f"API error: {exc}")
             return None
@@ -203,113 +218,119 @@ class ChatSession:
         tools: list[dict[str, Any]] | None,
     ) -> str:
         """Stream a response, handling tool calls for up to MAX_TOOL_ROUNDS."""
-        assert self._client is not None
-        local_messages = list(messages)
+        if self._client is None:
+            raise RuntimeError("Client not initialized.")
+
+        local_messages: list[Message] = list(messages)
 
         for round_num in range(MAX_TOOL_ROUNDS + 1):
-            # Last round: disable tools to force a final text response
+            # On the final round, disable tools to force a text response
             round_tools = tools if (tools and round_num < MAX_TOOL_ROUNDS) else None
 
-            kwargs: dict[str, Any] = {
-                "model": self.model,
-                "messages": local_messages,
-                "stream": self.settings.stream,
-                "temperature": self.temperature,
-            }
-            if self.settings.max_tokens:
-                kwargs["max_tokens"] = self.settings.max_tokens
-            if round_tools:
-                kwargs["tools"] = round_tools
-                kwargs["tool_choice"] = "auto"
+            request_kwargs = self._build_request_kwargs(local_messages, round_tools)
 
             if self.settings.stream:
-                text, tool_calls, usage = await self._stream_response(kwargs)
+                text, tool_calls, usage = await self._stream_response(request_kwargs)
             else:
-                text, tool_calls, usage = await self._blocking_response(kwargs)
+                text, tool_calls, usage = await self._blocking_response(request_kwargs)
 
-            # Track token usage
-            if usage:
-                self.total_tokens += usage.get("total_tokens", 0)
-                if self.settings.show_token_usage and usage.get("total_tokens"):
-                    render_token_usage(
-                        usage.get("prompt_tokens", 0),
-                        usage.get("completion_tokens", 0),
-                        usage.get("total_tokens", 0),
-                    )
+            self._record_usage(usage)
 
-            # If no tool calls, we have our final answer
+            # No tool calls → final answer
             if not tool_calls:
                 return text
 
-            # Execute tool calls and add results to local message history
-            local_messages.append(
-                {"role": "assistant", "content": text or None, "tool_calls": tool_calls}
-            )
-            for tc in tool_calls:
-                fn = tc["function"]
-                name = fn["name"]
-                try:
-                    args = json.loads(fn.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    args = {}
-
-                render_tool_call(name, fn.get("arguments", ""))
-                result = await self._mcp.call_tool(name, args)
-                render_tool_result(name, result)
-
-                local_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                })
-
+            local_messages = await self._execute_tool_calls(local_messages, text, tool_calls)
             render_separator()
 
-        return ""  # Should not reach here
+        return ""  # Unreachable; satisfies the type checker
+
+    def _build_request_kwargs(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Assemble keyword arguments for the chat completions API call."""
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": self.settings.stream,
+            "temperature": self.temperature,
+        }
+        if self.settings.max_tokens:
+            kwargs["max_tokens"] = self.settings.max_tokens
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return kwargs
+
+    def _record_usage(self, usage: TokenUsage | None) -> None:
+        """Update the running token total and optionally render usage stats."""
+        if not usage:
+            return
+        self.total_tokens += usage.get("total_tokens", 0)
+        if self.settings.show_token_usage and usage.get("total_tokens"):
+            render_token_usage(
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                usage.get("total_tokens", 0),
+            )
+
+    async def _execute_tool_calls(
+        self,
+        messages: list[Message],
+        assistant_text: str,
+        tool_calls: list[dict[str, Any]],
+    ) -> list[Message]:
+        """Run each tool call, append results, return the extended message list."""
+        updated = list(messages)
+        updated.append({"role": "assistant", "content": assistant_text or None, "tool_calls": tool_calls})
+
+        for tc in tool_calls:
+            fn = tc["function"]
+            name = fn["name"]
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+
+            render_tool_call(name, fn.get("arguments", ""))
+            result = await self._mcp.call_tool(name, args)  # type: ignore[union-attr]
+            render_tool_result(name, result)
+
+            updated.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+
+        return updated
 
     async def _stream_response(
         self, kwargs: dict[str, Any]
-    ) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
-        """Stream a response; collect text + any tool call chunks."""
-        assert self._client is not None
+    ) -> tuple[str, list[dict[str, Any]], TokenUsage | None]:
+        """Stream a response; collect text and any tool-call chunks."""
+        if self._client is None:
+            raise RuntimeError("Client not initialized.")
 
         tool_call_accumulator: dict[int, dict[str, Any]] = {}
-        usage: dict[str, Any] | None = None
+        usage: TokenUsage | None = None
 
         async with self._renderer.live_display(self.model, show_thinking=True) as renderer:
             stream = await self._client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 choice = chunk.choices[0] if chunk.choices else None
-
                 if choice is None:
                     continue
 
                 delta = choice.delta
 
-                # ── Text token ────────────────────────────────────────────────
                 if delta.content:
                     renderer.push(delta.content)
 
-                # ── Tool call chunk ───────────────────────────────────────────
                 if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tool_call_accumulator:
-                            tool_call_accumulator[idx] = {
-                                "id": tc_delta.id or "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        acc = tool_call_accumulator[idx]
-                        if tc_delta.id:
-                            acc["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                acc["function"]["name"] += tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                acc["function"]["arguments"] += tc_delta.function.arguments
+                    self._accumulate_tool_call_chunks(tool_call_accumulator, delta.tool_calls)
 
-                # ── Usage (last chunk) ────────────────────────────────────────
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage = {
                         "prompt_tokens": chunk.usage.prompt_tokens,
@@ -320,34 +341,60 @@ class ChatSession:
         tool_calls = list(tool_call_accumulator.values()) if tool_call_accumulator else []
         return renderer.text, tool_calls, usage
 
+    @staticmethod
+    def _accumulate_tool_call_chunks(
+        accumulator: dict[int, dict[str, Any]],
+        tc_deltas: Any,
+    ) -> None:
+        """Merge streaming tool-call delta chunks into the accumulator."""
+        for tc_delta in tc_deltas:
+            idx = tc_delta.index
+            if idx not in accumulator:
+                accumulator[idx] = {
+                    "id": tc_delta.id or "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+            acc = accumulator[idx]
+            if tc_delta.id:
+                acc["id"] = tc_delta.id
+            if tc_delta.function:
+                if tc_delta.function.name:
+                    acc["function"]["name"] += tc_delta.function.name
+                if tc_delta.function.arguments:
+                    acc["function"]["arguments"] += tc_delta.function.arguments
+
     async def _blocking_response(
         self, kwargs: dict[str, Any]
-    ) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+    ) -> tuple[str, list[dict[str, Any]], TokenUsage | None]:
         """Non-streaming response (stream=False)."""
-        assert self._client is not None
-        kwargs = {**kwargs, "stream": False}
+        if self._client is None:
+            raise RuntimeError("Client not initialized.")
+
+        non_stream_kwargs = {**kwargs, "stream": False}
 
         with console.status(f"[cyan]{self.model} is thinking…[/cyan]"):
-            response = await self._client.chat.completions.create(**kwargs)
+            response = await self._client.chat.completions.create(**non_stream_kwargs)
 
         choice = response.choices[0]
         msg = choice.message
         text = msg.content or ""
 
         if text:
-            from .renderer import render_message
             render_message("assistant", text, self.settings.theme)
 
         tool_calls: list[dict[str, Any]] = []
         if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tool_calls.append({
+            tool_calls = [
+                {
                     "id": tc.id,
                     "type": "function",
                     "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                })
+                }
+                for tc in msg.tool_calls
+            ]
 
-        usage = None
+        usage: TokenUsage | None = None
         if response.usage:
             usage = {
                 "prompt_tokens": response.usage.prompt_tokens,
@@ -369,9 +416,8 @@ class ChatSession:
             self.history = self.history[-limit:]
 
     def _build_messages(self) -> list[Message]:
-        """Prepend system prompt to history."""
-        system: list[Message] = [{"role": "system", "content": self.system_prompt}]
-        return system + self.history
+        """Prepend the system prompt to conversation history."""
+        return [{"role": "system", "content": self.system_prompt}, *self.history]
 
     # ── UI helpers ────────────────────────────────────────────────────────────
 

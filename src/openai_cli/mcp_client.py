@@ -32,10 +32,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from rich.table import Table
+
 from .utils import console
 
 logger = logging.getLogger(__name__)
@@ -134,8 +136,9 @@ class MCPManager:
         logger.debug("Calling tool %r on server %r", tool_name, server_name)
 
         try:
-            result = await self._call_on_server(server, tool_name, arguments)
-            return result
+            async with _server_session(server) as session:
+                result = await session.call_tool(tool_name, arguments)
+                return _extract_tool_result(result)
         except Exception as exc:  # noqa: BLE001
             logger.error("Tool call failed: %s", exc)
             return f"Error calling {tool_name}: {exc}"
@@ -172,7 +175,7 @@ class MCPManager:
 
         for name, srv in self._servers.items():
             endpoint = srv.url or f"{srv.command} {' '.join(srv.args)}"
-            tool_count = sum(1 for _, s in self._tool_server_map.items() if s == name)
+            tool_count = sum(1 for s in self._tool_server_map.values() if s == name)
             status = "✓" if srv.enabled else "○"
             style = "" if srv.enabled else "dim"
             table.add_row(name, srv.transport, endpoint, str(tool_count), status, style=style)
@@ -200,58 +203,48 @@ class MCPManager:
             return {}
 
     async def _load_server_tools(self, name: str, server: ServerConfig) -> None:
-        """Connect to a server, list tools, disconnect."""
+        """Connect to a server, list its tools, then disconnect."""
         try:
-            tools: list[MCPTool] = await self._list_tools(server)
+            async with _server_session(server) as session:
+                result = await session.list_tools()
+                tools: list[MCPTool] = result.tools
+
             for tool in tools:
-                openai_tool = _mcp_tool_to_openai(tool)
-                self._tools.append(openai_tool)
+                self._tools.append(_mcp_tool_to_openai(tool))
                 self._tool_server_map[tool.name] = name
             logger.debug("Server %r: loaded %d tool(s)", name, len(tools))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not connect to MCP server %r: %s", name, exc)
-            console.print(f"[yellow]Warning:[/yellow] MCP server [bold]{name}[/bold] unavailable: {exc}")
-
-    async def _list_tools(self, server: ServerConfig) -> list[Any]:
-        """Open a short-lived session to list tools."""
-        if server.transport == "sse":
-            async with sse_client(server.url) as (read, write):  # type: ignore[arg-type]
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.list_tools()
-                    return result.tools
-        else:
-            params = StdioServerParameters(
-                command=server.command,
-                args=server.args,
-                env=server.env,
+            console.print(
+                f"[yellow]Warning:[/yellow] MCP server [bold]{name}[/bold] unavailable: {exc}"
             )
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.list_tools()
-                    return result.tools
 
-    async def _call_on_server(
-        self, server: ServerConfig, tool_name: str, arguments: dict[str, Any]
-    ) -> str:
-        if server.transport == "sse":
-            async with sse_client(server.url) as (read, write):  # type: ignore[arg-type]
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.call_tool(tool_name, arguments)
-                    return _extract_tool_result(result)
-        else:
-            params = StdioServerParameters(
-                command=server.command,
-                args=server.args,
-                env=server.env,
-            )
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.call_tool(tool_name, arguments)
-                    return _extract_tool_result(result)
+
+# ── Transport abstraction ─────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def _server_session(server: ServerConfig) -> AsyncIterator["ClientSession"]:
+    """Open a short-lived MCP ClientSession for any supported transport.
+
+    Centralises the stdio/SSE branching so callers never duplicate it.
+    Yields a fully-initialised ``ClientSession`` and cleans up on exit.
+    """
+    if server.transport == "sse":
+        async with sse_client(server.url) as (read, write):  # type: ignore[arg-type]
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+    else:
+        params = StdioServerParameters(
+            command=server.command,
+            args=server.args,
+            env=server.env,
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
 
 
 # ── Conversion helpers ────────────────────────────────────────────────────────
@@ -261,7 +254,11 @@ def _mcp_tool_to_openai(tool: Any) -> dict[str, Any]:
     """Convert an MCP Tool to an OpenAI function-calling tool dict."""
     schema: dict[str, Any] = {}
     if hasattr(tool, "inputSchema") and tool.inputSchema:
-        schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else tool.inputSchema.model_dump()
+        schema = (
+            tool.inputSchema
+            if isinstance(tool.inputSchema, dict)
+            else tool.inputSchema.model_dump()
+        )
 
     return {
         "type": "function",

@@ -18,6 +18,7 @@ from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from .utils import console
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ class Settings(BaseSettings):
 
 # ── Loaders ──────────────────────────────────────────────────────────────────
 
+
 def _load_config_file(path: Path) -> dict[str, Any]:
     """Load JSON config file; return empty dict if not found."""
     if not path.exists():
@@ -117,25 +119,30 @@ def _load_config_file(path: Path) -> dict[str, Any]:
         return {}
 
 
+# Maps argparse attribute names → Settings field names.
+# All entries are optional: a None value on the namespace is ignored.
+_CLI_TO_SETTINGS: dict[str, str] = {
+    "model": "model",
+    "system": "system_prompt",
+    "temperature": "temperature",
+    "max_tokens": "max_tokens",
+    "base_url": "base_url",
+    "api_key": "api_key",
+    "timeout": "timeout",
+    "stream": "stream",          # populated by _normalize_stream_arg in main.py
+    "config_file": "config_file",
+    "mcp_file": "mcp_file",
+    "no_mcp": "no_mcp",
+    "log_level": "log_level",
+    "log_file": "log_file",
+}
+
+
 def _args_to_overrides(args: argparse.Namespace) -> dict[str, Any]:
     """Convert non-None CLI args to a settings override dict."""
-    mapping: dict[str, str] = {
-        "model": "model",
-        "system": "system_prompt",
-        "temperature": "temperature",
-        "max_tokens": "max_tokens",
-        "base_url": "base_url",
-        "api_key": "api_key",
-        "timeout": "timeout",
-        "config_file": "config_file",
-        "mcp_file": "mcp_file",
-        "no_mcp": "no_mcp",
-        "log_level": "log_level",
-        "log_file": "log_file",
-    }
     return {
         settings_key: getattr(args, arg_key)
-        for arg_key, settings_key in mapping.items()
+        for arg_key, settings_key in _CLI_TO_SETTINGS.items()
         if getattr(args, arg_key, None) is not None
     }
 
