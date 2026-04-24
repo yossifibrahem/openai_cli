@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 from openai import AsyncOpenAI
 
-from .config import DEFAULT_CONFIG_FILE, Settings, save_config
+# BUG FIX: previously redefined AVAILABLE_THEMES locally, risking divergence
+# from the canonical list in config.py. Import it instead.
+from .config import DEFAULT_CONFIG_FILE, AVAILABLE_THEMES, Settings, save_config
 from .utils import console
-
-AVAILABLE_THEMES = ["monokai", "dracula", "github-dark", "one-dark", "solarized-dark"]
 
 
 def _prompt_api_key() -> str:
-    """Prompt for API key, checking env first."""
+    """Prompt for API key, checking env var first."""
     env_key = os.environ.get("OPENAI_API_KEY", "")
     if env_key:
-        console.print(f"[dim]Using API key from OPENAI_API_KEY environment variable.[/dim]")
+        console.print("[dim]Using API key from OPENAI_API_KEY environment variable.[/dim]")
         console.print("[dim]Press Enter to keep it, or type a new one:[/dim] ")
         user_input = console.input().strip()
         return user_input if user_input else env_key
@@ -56,19 +55,18 @@ def _prompt_base_url() -> str:
 
 
 async def _fetch_models(api_key: str, base_url: str) -> list[str]:
-    """Fetch available models from the API."""
+    """Fetch available models from the API, returning an empty list on failure."""
     try:
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         page = await client.models.list()
-        models = sorted(m.id for m in page.data)
-        return models
-    except Exception as exc:
+        return sorted(m.id for m in page.data)
+    except Exception as exc:  # noqa: BLE001
         console.print(f"[yellow]Could not fetch models: {exc}[/yellow]")
         return []
 
 
 async def _prompt_model(api_key: str, base_url: str) -> str:
-    """Prompt for model selection."""
+    """Prompt for model selection with live model list."""
     console.print()
     console.print("[bold]Step 3: Choose a Model[/bold]")
 
@@ -80,28 +78,28 @@ async def _prompt_model(api_key: str, base_url: str) -> str:
         console.print("[dim]You can change this later with /model command.[/dim]")
         return "gpt-4o"
 
-    console.print("[bold]Available models:[/bold]")
-    console.print()
-
+    # Sort preferred models to the top of the displayed list.
     preferred = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]
+    seen: set[str] = set()
     shown: list[str] = []
 
     for pref in preferred:
         for m in models:
-            if m == pref or m.startswith(pref + "-"):
-                if m not in shown:
-                    shown.append(m)
+            if m not in seen and (m == pref or m.startswith(pref + "-")):
+                shown.append(m)
+                seen.add(m)
 
     for m in models:
-        if m not in shown:
+        if m not in seen:
             shown.append(m)
+            seen.add(m)
 
+    console.print("[bold]Available models:[/bold]")
+    console.print()
     for i, model_id in enumerate(shown[:15], 1):
         console.print(f"  [{i}] {model_id}")
-
     if len(shown) > 15:
         console.print(f"  [dim]... and {len(shown) - 15} more[/dim]")
-
     console.print()
     console.print("[dim]Enter the number or name (default: 1 = gpt-4o)[/dim]")
 
@@ -117,6 +115,7 @@ async def _prompt_model(api_key: str, base_url: str) -> str:
         elif choice in models:
             return choice
         else:
+            # Partial prefix match against the displayed list
             for m in shown:
                 if m.startswith(choice.lower()):
                     return m
@@ -148,7 +147,6 @@ def _prompt_theme() -> str:
 
     for i, theme in enumerate(AVAILABLE_THEMES, 1):
         console.print(f"  [{i}] {theme}")
-
     console.print()
     console.print("[dim]Enter the number (default: 1 = monokai)[/dim]")
 
@@ -167,10 +165,9 @@ def _prompt_theme() -> str:
 
 
 async def run_wizard() -> Settings:
-    """Run the interactive first-run wizard."""
+    """Run the interactive first-run wizard and return the new Settings."""
     api_key = _prompt_api_key()
     base_url = _prompt_base_url()
-
     model = await _prompt_model(api_key, base_url)
     system_prompt = _prompt_system_prompt()
     theme = _prompt_theme()

@@ -33,7 +33,7 @@ class SlashCommand:
     usage: str                      # e.g. "/model <name>"
     handler: AsyncHandler
     aliases: list[str] = field(default_factory=list)
-    completer_choices: list[str] = field(default_factory=list)  # dynamic — filled at runtime
+    completer_choices: list[str] = field(default_factory=list)  # populated at runtime
 
 
 @dataclass
@@ -108,8 +108,11 @@ async def _cmd_help(ctx: CommandContext) -> None:
     table.add_column("Description", style="white")
 
     for cmd in ctx.session.registry.all_commands():
-        aliases = f"  [dim]({', '.join('/' + a for a in cmd.aliases)})[/dim]" if cmd.aliases else ""
-        table.add_row(cmd.usage + aliases, cmd.description)
+        alias_str = (
+            f"  [dim]({', '.join('/' + a for a in cmd.aliases)})[/dim]"
+            if cmd.aliases else ""
+        )
+        table.add_row(cmd.usage + alias_str, cmd.description)
 
     console.print(table)
 
@@ -142,7 +145,7 @@ async def _cmd_system(ctx: CommandContext) -> None:
         return
     ctx.session.system_prompt = ctx.args.strip()
     ctx.session.clear_history()
-    console.print("[green]✓[/green] System prompt updated (history cleared).")
+    console.print("[green]✓[/green] System prompt updated. History cleared.")
 
 
 async def _cmd_save(ctx: CommandContext) -> None:
@@ -174,12 +177,15 @@ async def _cmd_load(ctx: CommandContext) -> None:
     path_str = ctx.args.strip()
 
     if not path_str:
-        # List saved conversations
         history_dir = session.settings.history_dir
         if not history_dir.exists():
             console.print("[dim]No saved conversations.[/dim]")
             return
-        files = sorted(history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        files = sorted(
+            history_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if not files:
             console.print("[dim]No saved conversations.[/dim]")
             return
@@ -188,7 +194,7 @@ async def _cmd_load(ctx: CommandContext) -> None:
             console.print(f"  {i}. [bold]{f.name}[/bold]  [dim]{f.stat().st_size // 1024}KB[/dim]")
         return
 
-    # Try as absolute path, then relative to history_dir
+    # Accept absolute paths or names relative to history_dir.
     path = Path(path_str)
     if not path.is_absolute():
         path = session.settings.history_dir / path_str
@@ -197,7 +203,7 @@ async def _cmd_load(ctx: CommandContext) -> None:
         console.print(f"[red]File not found:[/red] {path}")
         return
 
-    data = json.loads(path.read_text())
+    data: dict[str, Any] = json.loads(path.read_text())
     session.model = data.get("model", session.model)
     session.system_prompt = data.get("system_prompt", session.system_prompt)
     session.history = data.get("messages", [])
@@ -243,8 +249,8 @@ async def _cmd_retry(ctx: CommandContext) -> None:
         return
 
     _strip_last_exchange(session.history)
-    console.print(f"[dim]Retrying: {str(last_user)[:60]}…[/dim]")
-    await session.send_message(str(last_user), from_retry=True)
+    console.print(f"[dim]Retrying: {last_user[:60]}…[/dim]")
+    await session.send_message(last_user, from_retry=True)
 
 
 def _find_last_user_message(history: list[dict[str, Any]]) -> str | None:
@@ -271,7 +277,7 @@ async def _cmd_copy(ctx: CommandContext) -> None:
         if msg["role"] == "assistant":
             content = msg.get("content") or ""
             try:
-                import pyperclip
+                import pyperclip  # type: ignore[import-untyped]
                 pyperclip.copy(str(content))
                 console.print("[green]✓[/green] Copied to clipboard.")
             except ImportError:
@@ -292,13 +298,23 @@ async def _cmd_tokens(ctx: CommandContext) -> None:
 
 
 async def _cmd_temp(ctx: CommandContext) -> None:
+    """View or set the sampling temperature for this session.
+
+    BUG FIX: previously wrote to ctx.session.temperature which did not exist
+    as an attribute on ChatSession, and _build_request_kwargs read from
+    self.settings.temperature (immutable).  ChatSession now exposes a
+    `temperature` instance attribute that _build_request_kwargs reads,
+    so this command actually takes effect.
+    """
     if not ctx.args.strip():
-        console.print(f"Temperature: [bold]{ctx.session.temperature}[/bold]")
+        value = ctx.session.temperature
+        display = str(value) if value is not None else "[dim]API default[/dim]"
+        console.print(f"Temperature: [bold]{display}[/bold]")
         return
     try:
         val = float(ctx.args.strip())
         if not 0.0 <= val <= 2.0:
-            raise ValueError
+            raise ValueError("out of range")
         ctx.session.temperature = val
         console.print(f"[green]✓[/green] Temperature set to [bold]{val}[/bold]")
     except ValueError:
@@ -320,7 +336,10 @@ async def _cmd_export(ctx: CommandContext) -> None:
     if not filename.endswith(".md"):
         filename += ".md"
 
-    lines = [f"# Chat Export — {datetime.now():%Y-%m-%d %H:%M}\n", f"**Model:** {session.model}\n\n"]
+    lines = [
+        f"# Chat Export — {datetime.now():%Y-%m-%d %H:%M}\n",
+        f"**Model:** {session.model}\n\n",
+    ]
     for msg in session.history:
         role = msg["role"].title()
         content = msg.get("content") or ""
@@ -338,7 +357,7 @@ async def _cmd_exit(ctx: CommandContext) -> None:
 
 async def _read_line_async(prompt: str) -> str:
     """Read a single line from stdin without blocking the event loop."""
-    loop = asyncio.get_running_loop()  # ← correct; get_event_loop() is deprecated in 3.10+
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, input, prompt)
 
 
@@ -369,22 +388,22 @@ def build_registry() -> CommandRegistry:
     registry = CommandRegistry()
 
     commands: list[SlashCommand] = [
-        SlashCommand("help",      "Show all available commands",              "/help",                _cmd_help,      aliases=["?"]),
-        SlashCommand("model",     "Switch to a different model",              "/model [name]",        _cmd_model),
-        SlashCommand("models",    "List all available models",                "/models",              _cmd_models),
-        SlashCommand("clear",     "Clear conversation history",               "/clear",               _cmd_clear,     aliases=["reset"]),
-        SlashCommand("system",    "View or set the system prompt",            "/system [prompt]",     _cmd_system),
-        SlashCommand("save",      "Save conversation to JSON",                "/save [filename]",     _cmd_save),
-        SlashCommand("load",      "Load a saved conversation",                "/load [filename]",     _cmd_load),
-        SlashCommand("history",   "Show recent conversation history",         "/history [n]",         _cmd_history,   aliases=["h"]),
-        SlashCommand("retry",     "Retry the last message",                   "/retry",               _cmd_retry),
-        SlashCommand("copy",      "Copy last response to clipboard",          "/copy",                _cmd_copy),
-        SlashCommand("tokens",    "Show token usage for this session",        "/tokens",              _cmd_tokens),
-        SlashCommand("temp",      "View or set temperature",                  "/temp [value]",        _cmd_temp),
-        SlashCommand("mcp",       "Show MCP servers and tools",               "/mcp",                 _cmd_mcp),
-        SlashCommand("export",    "Export conversation as Markdown",          "/export [filename]",   _cmd_export),
-        SlashCommand("multi",     "Enter multi-line input mode",              "/multi",               _cmd_multiline, aliases=["ml"]),
-        SlashCommand("exit",      "Exit the application",                     "/exit",                _cmd_exit,      aliases=["quit", "q"]),
+        SlashCommand("help",    "Show all available commands",              "/help",                _cmd_help,       aliases=["?"]),
+        SlashCommand("model",   "Switch to a different model",              "/model [name]",        _cmd_model),
+        SlashCommand("models",  "List all available models",                "/models",              _cmd_models),
+        SlashCommand("clear",   "Clear conversation history",               "/clear",               _cmd_clear,      aliases=["reset"]),
+        SlashCommand("system",  "View or set the system prompt",            "/system [prompt]",     _cmd_system),
+        SlashCommand("save",    "Save conversation to JSON",                "/save [filename]",     _cmd_save),
+        SlashCommand("load",    "Load a saved conversation",                "/load [filename]",     _cmd_load),
+        SlashCommand("history", "Show recent conversation history",         "/history [n]",         _cmd_history,    aliases=["h"]),
+        SlashCommand("retry",   "Retry the last message",                   "/retry",               _cmd_retry),
+        SlashCommand("copy",    "Copy last response to clipboard",          "/copy",                _cmd_copy),
+        SlashCommand("tokens",  "Show token usage for this session",        "/tokens",              _cmd_tokens),
+        SlashCommand("temp",    "View or set temperature",                  "/temp [value]",        _cmd_temp),
+        SlashCommand("mcp",     "Show MCP servers and tools",               "/mcp",                 _cmd_mcp),
+        SlashCommand("export",  "Export conversation as Markdown",          "/export [filename]",   _cmd_export),
+        SlashCommand("multi",   "Enter multi-line input mode",              "/multi",               _cmd_multiline,  aliases=["ml"]),
+        SlashCommand("exit",    "Exit the application",                     "/exit",                _cmd_exit,       aliases=["quit", "q"]),
     ]
 
     for cmd in commands:

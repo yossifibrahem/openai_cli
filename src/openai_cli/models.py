@@ -26,7 +26,7 @@ class ModelManager:
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def list_models(self, *, force_refresh: bool = False) -> list[str]:
-        """Return sorted list of available model IDs."""
+        """Return a sorted list of available model IDs, using a cache by default."""
         if self._cached_models and not force_refresh:
             return self._cached_models
 
@@ -42,7 +42,7 @@ class ModelManager:
         return self._cached_models
 
     async def list_and_display(self) -> None:
-        """Print available models, marking the active one."""
+        """Print available models, marking the currently active one."""
         with console.status("[cyan]Fetching models…[/cyan]"):
             models = await self.list_models(force_refresh=True)
 
@@ -58,9 +58,12 @@ class ModelManager:
                 console.print(f"  [dim]○[/dim] {model_id}")
 
     async def validate_model(self, name: str) -> str:
-        """Verify the model exists. Returns the name unchanged."""
+        """Verify the model exists; returns the name unchanged.
+
+        Issues a soft warning rather than raising — non-OpenAI deployments
+        may serve custom model IDs that won't appear in the listed models.
+        """
         models = await self.list_models()
         if models and name not in models:
-            # Soft warning — non-OpenAI deployments may have custom models
             logger.warning("Model %r not in listed models (may still work)", name)
         return name

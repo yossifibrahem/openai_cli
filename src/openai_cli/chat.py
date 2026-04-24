@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, TypedDict
+from typing import TYPE_CHECKING, Any, Coroutine, TypedDict
 
 import openai
 from openai import AsyncOpenAI
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Maximum tool-call rounds per user message (prevents infinite loops)
+# Maximum tool-call rounds per user message (prevents infinite loops).
 MAX_TOOL_ROUNDS = 6
 
 
@@ -50,20 +50,11 @@ class TokenUsage(TypedDict):
     total_tokens: int
 
 
-# Error messages mapped by exception type
-_API_ERROR_MESSAGES: dict[type[openai.APIError], str] = {
-    openai.AuthenticationError: "Authentication failed. Check your API key.",
-    openai.RateLimitError: "Rate limit exceeded. Wait a moment and try again.",
-    openai.BadRequestError: "Bad request: {exc}",
-    openai.APIConnectionError: "Could not connect to the API. Check your network / base_url.",
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ── ChatSession ───────────────────────────────────────────────────────────────
 
 
 class ChatSession:
-    """Holds conversation state and drives the REPL."""
+    """Holds conversation state and drives the interactive REPL."""
 
     def __init__(self, settings: "Settings") -> None:
         self.settings = settings
@@ -71,6 +62,12 @@ class ChatSession:
         self.system_prompt: str = settings.system_prompt
         self.history: list[Message] = []
         self.total_tokens: int = 0
+
+        # BUG FIX: expose `temperature` as a session-level attribute so that
+        # the /temp command can override it at runtime without mutating the
+        # immutable Settings object.  _build_request_kwargs reads this field
+        # instead of self.settings.temperature.
+        self.temperature: float | None = settings.temperature
 
         self._client: AsyncOpenAI | None = None
         self._registry: "CommandRegistry | None" = None
@@ -114,10 +111,10 @@ class ChatSession:
         self._mcp = MCPManager(self.settings.mcp_file, disabled=self.settings.no_mcp)
         self._registry = build_registry()
 
-        # MCP must be initialized before the first send
+        # MCP must be initialized before the first send.
         await self._mcp.initialize()
 
-        # Populate model completer choices
+        # Populate model completer choices for tab-completion in the REPL.
         model_cmd = self._registry.get("model")
         if model_cmd:
             model_cmd.completer_choices = await self._model_manager.list_models()
@@ -195,19 +192,30 @@ class ChatSession:
         return response_text
 
     async def _execute_api_call(self, coro: Coroutine[Any, Any, str]) -> str | None:
-        """Await an API coroutine with consistent error mapping."""
+        """Await an API coroutine, mapping known OpenAI exceptions to user-facing errors.
+
+        BUG FIX: the previous implementation caught `openai.APIStatusError` first,
+        which made the `_API_ERROR_MESSAGES` dict dead code — AuthenticationError,
+        RateLimitError, and BadRequestError are all subclasses of APIStatusError and
+        were therefore always handled by the generic branch. The fix is to catch the
+        specific subclasses first (most-specific → least-specific).
+        """
         try:
             return await coro
+        except openai.AuthenticationError:
+            render_error("Authentication failed. Check your API key.")
+        except openai.RateLimitError:
+            render_error("Rate limit exceeded. Wait a moment and try again.")
+        except openai.BadRequestError as exc:
+            render_error(f"Bad request: {exc}")
+        except openai.APIConnectionError:
+            render_error("Could not connect to the API. Check your network / base_url.")
         except openai.APIStatusError as exc:
+            # Catch-all for any other HTTP error codes (5xx, 429 variants, etc.).
             render_error(f"API error {exc.status_code}: {exc.message}")
-            return None
         except openai.APIError as exc:
-            template = _API_ERROR_MESSAGES.get(type(exc))
-            if template:
-                render_error(template.format(exc=exc) if "{exc}" in template else template)
-            else:
-                render_error(f"API error: {exc}")
-            return None
+            render_error(f"API error: {exc}")
+        return None
 
     # ── Streaming + tool loop ─────────────────────────────────────────────────
 
@@ -217,13 +225,14 @@ class ChatSession:
         tools: list[dict[str, Any]] | None,
     ) -> str:
         """Stream a response, handling tool calls for up to MAX_TOOL_ROUNDS."""
-        if self._client is None:
-            raise RuntimeError("Client not initialized.")
+        # _client is guaranteed non-None here: callers are all reached via
+        # send_message(), which guards with an explicit RuntimeError check.
+        assert self._client is not None
 
         local_messages: list[Message] = list(messages)
 
         for round_num in range(MAX_TOOL_ROUNDS + 1):
-            # On the final round, disable tools to force a text response
+            # On the final round, disable tools to force a plain text response.
             round_tools = tools if (tools and round_num < MAX_TOOL_ROUNDS) else None
 
             request_kwargs = self._build_request_kwargs(local_messages, round_tools)
@@ -235,30 +244,40 @@ class ChatSession:
 
             self._record_usage(usage)
 
-            # No tool calls → final answer
             if not tool_calls:
                 return text
 
             local_messages = await self._execute_tool_calls(local_messages, text, tool_calls)
             render_separator()
 
-        return ""  # Unreachable; satisfies the type checker
+        return ""  # Satisfies the type checker; the loop always returns earlier.
 
     def _build_request_kwargs(
         self,
         messages: list[Message],
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
-        """Assemble keyword arguments for the chat completions API call."""
+        """Assemble keyword arguments for the chat completions API call.
+
+        BUG FIX: previously read self.settings.temperature, which meant the
+        /temp command had no visible effect.  Now reads self.temperature so
+        that runtime overrides are respected.
+
+        NOTE: `stream` is intentionally omitted here; each call site
+        (_stream_response / _blocking_response) injects the correct value,
+        which avoids `_blocking_response` needing to defensively override it
+        with `{**kwargs, "stream": False}`.
+        """
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "stream": self.settings.stream,
         }
+        # Only send parameters that have been explicitly configured; omitting
+        # them lets the API server apply its own defaults.
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         if self.settings.max_tokens is not None:
             kwargs["max_tokens"] = self.settings.max_tokens
-        if self.settings.temperature is not None:
-            kwargs["temperature"] = self.settings.temperature
         if self.settings.top_p is not None:
             kwargs["top_p"] = self.settings.top_p
         if self.settings.presence_penalty is not None:
@@ -289,14 +308,18 @@ class ChatSession:
         tool_calls: list[dict[str, Any]],
     ) -> list[Message]:
         """Run each tool call, append results, return the extended message list."""
-        updated = list(messages)
-        updated.append({"role": "assistant", "content": assistant_text or None, "tool_calls": tool_calls})
+        updated: list[Message] = list(messages)
+        updated.append({
+            "role": "assistant",
+            "content": assistant_text or None,
+            "tool_calls": tool_calls,
+        })
 
         for tc in tool_calls:
             fn = tc["function"]
-            name = fn["name"]
+            name: str = fn["name"]
             try:
-                args = json.loads(fn.get("arguments", "{}"))
+                args: dict[str, Any] = json.loads(fn.get("arguments", "{}"))
             except json.JSONDecodeError:
                 args = {}
 
@@ -315,15 +338,14 @@ class ChatSession:
     async def _stream_response(
         self, kwargs: dict[str, Any]
     ) -> tuple[str, list[dict[str, Any]], TokenUsage | None]:
-        """Stream a response; collect text and any tool-call chunks."""
-        if self._client is None:
-            raise RuntimeError("Client not initialized.")
+        """Stream a response; collect text and any tool-call delta chunks."""
+        assert self._client is not None
 
         tool_call_accumulator: dict[int, dict[str, Any]] = {}
         usage: TokenUsage | None = None
 
         async with self._renderer.live_display(self.model, show_thinking=True) as renderer:
-            stream = await self._client.chat.completions.create(**kwargs)
+            stream = await self._client.chat.completions.create(**kwargs, stream=True)
             async for chunk in stream:
                 choice = chunk.choices[0] if chunk.choices else None
                 if choice is None:
@@ -354,7 +376,7 @@ class ChatSession:
     ) -> None:
         """Merge streaming tool-call delta chunks into the accumulator."""
         for tc_delta in tc_deltas:
-            idx = tc_delta.index
+            idx: int = tc_delta.index
             if idx not in accumulator:
                 accumulator[idx] = {
                     "id": tc_delta.id or "",
@@ -373,18 +395,22 @@ class ChatSession:
     async def _blocking_response(
         self, kwargs: dict[str, Any]
     ) -> tuple[str, list[dict[str, Any]], TokenUsage | None]:
-        """Non-streaming response (stream=False)."""
-        if self._client is None:
-            raise RuntimeError("Client not initialized.")
+        """Non-streaming response path (stream=False).
 
-        non_stream_kwargs = {**kwargs, "stream": False}
+        BUG FIX: previously received a `kwargs` dict that already contained
+        `"stream": True` (from _build_request_kwargs) and then overrode it
+        with `{**kwargs, "stream": False}`.  Now _build_request_kwargs omits
+        the stream key entirely and each call site injects the correct value,
+        removing the need for the defensive override.
+        """
+        assert self._client is not None
 
         with console.status(f"[cyan]{self.model} is thinking…[/cyan]"):
-            response = await self._client.chat.completions.create(**non_stream_kwargs)
+            response = await self._client.chat.completions.create(**kwargs, stream=False)
 
         choice = response.choices[0]
         msg = choice.message
-        text = msg.content or ""
+        text: str = msg.content or ""
 
         if text:
             render_message("assistant", text, self.settings.theme)
@@ -416,7 +442,7 @@ class ChatSession:
         self.history = []
 
     def _trim_history(self) -> None:
-        """Keep history within context_window message count."""
+        """Keep history within the configured context_window message count."""
         limit = self.settings.context_window
         if len(self.history) > limit:
             self.history = self.history[-limit:]

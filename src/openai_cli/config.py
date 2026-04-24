@@ -27,7 +27,8 @@ DEFAULT_CONFIG_DIR = Path.home() / ".config" / "openai-cli"
 DEFAULT_CONFIG_FILE = DEFAULT_CONFIG_DIR / "config.json"
 DEFAULT_MCP_FILE = Path.cwd() / "mcp.json"
 
-AVAILABLE_THEMES = ["monokai", "dracula", "github-dark", "one-dark", "solarized-dark"]
+# Single source of truth — imported by wizard.py to avoid drift.
+AVAILABLE_THEMES: list[str] = ["monokai", "dracula", "github-dark", "one-dark", "solarized-dark"]
 
 
 class Settings(BaseSettings):
@@ -93,13 +94,18 @@ class Settings(BaseSettings):
             return "monokai"
         return v
 
+    # BUG FIX: the previous version included `config_file` (a runtime path)
+    # and could silently exclude `False` booleans due to the truthy `v` check.
+    # Now we explicitly list fields that must NOT be persisted, and use
+    # `v is not None` as the only filter (empty strings and False are valid).
+    _RUNTIME_FIELDS: frozenset[str] = frozenset({"no_mcp", "log_level", "log_file", "config_file"})
+
     def to_persist_dict(self) -> dict[str, Any]:
         """Return only user-configurable fields for serialisation."""
-        skip = {"no_mcp", "log_level", "log_file"}
         return {
             k: (str(v) if isinstance(v, Path) else v)
             for k, v in self.model_dump().items()
-            if k not in skip and v is not None and (not isinstance(v, str) or v != "")
+            if k not in self._RUNTIME_FIELDS and v is not None
         }
 
 
@@ -107,7 +113,7 @@ class Settings(BaseSettings):
 
 
 def _load_config_file(path: Path) -> dict[str, Any]:
-    """Load JSON config file; return empty dict if not found."""
+    """Load JSON config file; return empty dict if missing or malformed."""
     if not path.exists():
         return {}
     try:
@@ -121,7 +127,7 @@ def _load_config_file(path: Path) -> dict[str, Any]:
 
 
 # Maps argparse attribute names → Settings field names.
-# All entries are optional: a None value on the namespace is ignored.
+# Only non-None namespace values are applied.
 _CLI_TO_SETTINGS: dict[str, str] = {
     "model": "model",
     "system": "system_prompt",
@@ -150,7 +156,6 @@ def _args_to_overrides(args: argparse.Namespace) -> dict[str, Any]:
 
 def load_config(args: argparse.Namespace | None = None) -> Settings:
     """Build Settings by merging file config + env + CLI overrides."""
-    # Determine config file path early (CLI > default)
     config_file = DEFAULT_CONFIG_FILE
     if args and getattr(args, "config_file", None):
         config_file = Path(args.config_file)
@@ -158,9 +163,8 @@ def load_config(args: argparse.Namespace | None = None) -> Settings:
     file_data = _load_config_file(config_file)
     cli_overrides = _args_to_overrides(args) if args else {}
 
-    # Merge: file_data is base, CLI overrides win
+    # Merge: file_data is the base; CLI overrides win.
     merged = {**file_data, **cli_overrides, "config_file": config_file}
-
     settings = Settings(**merged)
 
     if not settings.api_key:

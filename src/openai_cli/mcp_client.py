@@ -68,6 +68,7 @@ class ServerConfig:
         # Stdio transport
         self.command: str | None = raw.get("command")
         self.args: list[str] = raw.get("args", [])
+        # Merge parent environment so subprocesses inherit PATH etc.
         self.env: dict[str, str] = {**os.environ, **raw.get("env", {})}
         self.enabled: bool = raw.get("enabled", True)
 
@@ -91,14 +92,14 @@ class MCPManager:
         self._mcp_file = mcp_file
         self._disabled = disabled
         self._servers: dict[str, ServerConfig] = {}
-        self._tools: list[dict[str, Any]] = []          # OpenAI-format tools
+        self._tools: list[dict[str, Any]] = []          # OpenAI-format tool defs
         self._tool_server_map: dict[str, str] = {}      # tool_name → server_name
         self._loaded = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        """Load mcp.json and discover tools from all servers."""
+        """Load mcp.json and discover tools from all enabled servers."""
         if self._disabled:
             logger.debug("MCP disabled via --no-mcp")
             return
@@ -113,7 +114,7 @@ class MCPManager:
         if not self._servers:
             return
 
-        enabled = {n: s for n, s in self._servers.items() if s.enabled}
+        enabled = {name: srv for name, srv in self._servers.items() if srv.enabled}
         logger.info("Loading tools from %d MCP server(s): %s", len(enabled), list(enabled))
 
         for name, server in enabled.items():
@@ -124,7 +125,7 @@ class MCPManager:
             logger.info("MCP: loaded %d tool(s) total", len(self._tools))
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Execute a tool and return the result as a string."""
+        """Execute a named tool and return the result as a string."""
         if not _MCP_AVAILABLE:
             return "Error: mcp package not installed."
 
@@ -177,8 +178,8 @@ class MCPManager:
             endpoint = srv.url or f"{srv.command} {' '.join(srv.args)}"
             tool_count = sum(1 for s in self._tool_server_map.values() if s == name)
             status = "✓" if srv.enabled else "○"
-            style = "" if srv.enabled else "dim"
-            table.add_row(name, srv.transport, endpoint, str(tool_count), status, style=style)
+            row_style = "" if srv.enabled else "dim"
+            table.add_row(name, srv.transport, endpoint, str(tool_count), status, style=row_style)
 
         console.print(table)
 
@@ -191,6 +192,7 @@ class MCPManager:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _load_mcp_json(self) -> dict[str, ServerConfig]:
+        """Parse mcp.json; return an empty dict on any error."""
         if not self._mcp_file.exists():
             logger.debug("No mcp.json at %s", self._mcp_file)
             return {}
@@ -227,7 +229,7 @@ class MCPManager:
 async def _server_session(server: ServerConfig) -> AsyncIterator["ClientSession"]:
     """Open a short-lived MCP ClientSession for any supported transport.
 
-    Centralises the stdio/SSE branching so callers never duplicate it.
+    Centralises stdio/SSE branching so callers never duplicate it.
     Yields a fully-initialised ``ClientSession`` and cleans up on exit.
     """
     if server.transport == "sse":
@@ -259,7 +261,6 @@ def _mcp_tool_to_openai(tool: Any) -> dict[str, Any]:
             if isinstance(tool.inputSchema, dict)
             else tool.inputSchema.model_dump()
         )
-
     return {
         "type": "function",
         "function": {
