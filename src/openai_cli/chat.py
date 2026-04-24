@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6
-CONTEXT_WINDOW = 20
 
 
 class _MessageRequired(TypedDict):
@@ -136,8 +135,6 @@ class ChatSession:
     async def send_message(self, content: str) -> str | None:
         assert self._client is not None
         self.history.append({"role": "user", "content": content})
-        self._trim_history()
-
         messages = self._build_messages()
         tools = self._mcp.tools if self._mcp and self._mcp.tools else None
 
@@ -212,14 +209,12 @@ class ChatSession:
                     if delta.tool_calls:
                         _accumulate_tool_calls(tool_call_accumulator, delta.tool_calls)
             except asyncio.CancelledError:
-                # Task was cancelled externally — flush partial output, then
-                # re-raise so the asyncio task system can shut down cleanly.
+                # asyncio delivers Ctrl-C as CancelledError inside coroutines.
+                # Treat it the same as KeyboardInterrupt here: flush partial
+                # output and stop streaming, but keep the app alive.
+                interrupted = True
                 renderer.mark_interrupted()
-                raise
             except KeyboardInterrupt:
-                # User pressed Ctrl-C mid-stream.  Flush whatever arrived and
-                # bail out cleanly — the Live context manager still runs its
-                # __exit__, printing the partial remainder via console.print().
                 interrupted = True
                 renderer.mark_interrupted()
 
@@ -260,35 +255,6 @@ class ChatSession:
         return updated
 
     # ── History helpers ───────────────────────────────────────────────────────
-
-    def _trim_history(self) -> None:
-        """Trim history to CONTEXT_WINDOW messages, but only at user-turn
-        boundaries.
-
-        Cutting inside a tool-call group (assistant message + one or more
-        tool-result messages) leaves orphaned ``tool_call_id`` entries with
-        no matching ``tool_calls`` on the assistant turn.  The API rejects
-        such histories.  We scan backwards to find the oldest user turn that
-        keeps the window within budget and slice there.
-        """
-        if len(self.history) <= CONTEXT_WINDOW:
-            return
-
-        # Walk forward and collect the index of each user-turn start.
-        user_turn_indices = [
-            i for i, m in enumerate(self.history) if m["role"] == "user"
-        ]
-
-        # Find the first user turn whose tail fits within the window.
-        for idx in user_turn_indices:
-            if len(self.history) - idx <= CONTEXT_WINDOW:
-                self.history = self.history[idx:]
-                return
-
-        # Fallback: keep the last CONTEXT_WINDOW messages (should not happen
-        # in normal use, but prevents unbounded growth if there are no user
-        # turns — e.g. a pure tool-call history).
-        self.history = self.history[-CONTEXT_WINDOW:]
 
     def _build_messages(self) -> list[Message]:
         return [{"role": "system", "content": self.settings.system_prompt}, *self.history]
