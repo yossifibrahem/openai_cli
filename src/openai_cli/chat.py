@@ -69,7 +69,6 @@ class ChatSession:
         self.settings = settings
         self.model: str = settings.model
         self.system_prompt: str = settings.system_prompt
-        self.temperature: float = settings.temperature
         self.history: list[Message] = []
         self.total_tokens: int = 0
 
@@ -255,10 +254,17 @@ class ChatSession:
             "model": self.model,
             "messages": messages,
             "stream": self.settings.stream,
-            "temperature": self.temperature,
         }
-        if self.settings.max_tokens:
+        if self.settings.max_tokens is not None:
             kwargs["max_tokens"] = self.settings.max_tokens
+        if self.settings.temperature is not None:
+            kwargs["temperature"] = self.settings.temperature
+        if self.settings.top_p is not None:
+            kwargs["top_p"] = self.settings.top_p
+        if self.settings.presence_penalty is not None:
+            kwargs["presence_penalty"] = self.settings.presence_penalty
+        if self.settings.frequency_penalty is not None:
+            kwargs["frequency_penalty"] = self.settings.frequency_penalty
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"

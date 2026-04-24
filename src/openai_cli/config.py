@@ -41,18 +41,19 @@ class Settings(BaseSettings):
     )
 
     # ── API connection ───────────────────────────────────────────────────────
-    api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    api_key: str | None = Field(default=None)
     base_url: str = Field(default="https://api.openai.com/v1")
     timeout: float = Field(default=60.0, ge=1.0, le=600.0)
     max_retries: int = Field(default=2, ge=0, le=5)
 
     # ── Model defaults ───────────────────────────────────────────────────────
+    # Sentinel defaults: None = use API server model defaults
     model: str = Field(default="gpt-4o")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    temperature: float | None = Field(default=None)
     max_tokens: int | None = Field(default=None)
-    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
-    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
-    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    top_p: float | None = Field(default=None)
+    presence_penalty: float | None = Field(default=None)
+    frequency_penalty: float | None = Field(default=None)
 
     # ── Chat behaviour ───────────────────────────────────────────────────────
     system_prompt: str = Field(default="You are a helpful assistant.")
@@ -78,11 +79,11 @@ class Settings(BaseSettings):
 
     @field_validator("api_key", mode="before")
     @classmethod
-    def _resolve_api_key(cls, v: Any) -> str:
-        """Also check OPENAI_API_KEY directly."""
+    def _resolve_api_key(cls, v: Any) -> str | None:
+        """Also check OPENAI_API_KEY from environment."""
         if not v:
-            return os.environ.get("OPENAI_API_KEY", "")
-        return str(v)
+            return os.environ.get("OPENAI_API_KEY")
+        return v
 
     @field_validator("theme")
     @classmethod
@@ -94,11 +95,11 @@ class Settings(BaseSettings):
 
     def to_persist_dict(self) -> dict[str, Any]:
         """Return only user-configurable fields for serialisation."""
-        skip = {"api_key", "no_mcp", "log_level", "log_file"}
+        skip = {"no_mcp", "log_level", "log_file"}
         return {
             k: (str(v) if isinstance(v, Path) else v)
             for k, v in self.model_dump().items()
-            if k not in skip and v is not None
+            if k not in skip and v is not None and (not isinstance(v, str) or v != "")
         }
 
 
@@ -180,3 +181,8 @@ def save_config(settings: Settings) -> None:
     with open(settings.config_file, "w") as f:
         json.dump(settings.to_persist_dict(), f, indent=2)
     logger.debug("Config saved to %s", settings.config_file)
+
+
+def config_exists() -> bool:
+    """Check if a config file already exists."""
+    return DEFAULT_CONFIG_FILE.exists()

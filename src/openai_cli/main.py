@@ -60,6 +60,7 @@ CONFIGURATION
   Default config file: ~/.config/openai-cli/config.json
   Environment variables: OPENAI_API_KEY, AI_MODEL, AI_BASE_URL, AI_TEMPERATURE, …
   .env file in the current directory is loaded automatically.
+  Run `ai --setup` to reconfigure the wizard.
 """,
     )
 
@@ -92,6 +93,8 @@ CONFIGURATION
                           help="Config file (default: ~/.config/openai-cli/config.json)")
     info_grp.add_argument("--list-models", action="store_true",
                           help="List available models and exit")
+    info_grp.add_argument("--setup", action="store_true",
+                          help="Run the setup wizard to reconfigure")
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_grp = parser.add_argument_group("Logging")
@@ -159,7 +162,7 @@ async def _interactive(settings: "Settings") -> None:  # noqa: F821
 
 def main() -> None:
     """CLI entry point — called by the ``ai`` script."""
-    from .config import load_config
+    from .config import config_exists, load_config
     from .utils import console, setup_logging
 
     parser = _build_parser()
@@ -170,10 +173,20 @@ def main() -> None:
     # Translate --no-stream into args.stream before config loading
     _normalize_stream_arg(args)
 
-    try:
-        settings = load_config(args)
-    except ValueError:
-        sys.exit(1)
+    # ── Check for first run or --setup flag ────────────────────────────────────────────
+    if args.setup or not config_exists():
+        from .wizard import run_wizard
+        import os
+
+        os.environ.setdefault("TERM", "xterm-color")
+        settings = asyncio.run(run_wizard())
+        if args.setup:
+            return
+    else:
+        try:
+            settings = load_config(args)
+        except ValueError:
+            sys.exit(1)
 
     # ── Non-interactive modes ─────────────────────────────────────────────────
     if args.list_models:
