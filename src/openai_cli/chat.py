@@ -14,6 +14,8 @@ from .mcp_client import MCPManager
 from .models import ModelManager
 from .renderer import (
     StreamingRenderer,
+    ToolChoice,
+    confirm_tool_call,
     render_error,
     render_info,
     render_separator,
@@ -183,7 +185,9 @@ class ChatSession:
             if not tool_calls:
                 return text
 
-            local_messages = await self._execute_tool_calls(local_messages, text, tool_calls)
+            local_messages, cancelled = await self._execute_tool_calls(local_messages, text, tool_calls)
+            if cancelled:
+                return text
             render_separator()
 
         # MAX_TOOL_ROUNDS exhausted — return whatever the model last said.
@@ -234,25 +238,69 @@ class ChatSession:
         messages: list[Message],
         assistant_text: str,
         tool_calls: list[dict[str, Any]],
-    ) -> list[Message]:
+    ) -> tuple[list[Message], bool]:
+        """Execute each tool call after user confirmation.
+
+        Returns ``(updated_messages, cancelled)`` where *cancelled* is ``True``
+        when the user chose **Cancel**, signalling ``_run_with_tools`` to stop
+        the tool loop immediately and return the current assistant text.
+        """
         updated: list[Message] = list(messages)
         updated.append({
             "role": "assistant",
             "content": assistant_text or None,
             "tool_calls": tool_calls,
         })
+
         for tc in tool_calls:
             fn = tc["function"]
             name: str = fn["name"]
+            raw_args: str = fn.get("arguments", "")
+
+            # ── Confirmation dialog ───────────────────────────────────────────
+            choice = await confirm_tool_call(name, raw_args)
+
+            if choice is ToolChoice.CANCEL:
+                # Append a synthetic tool result so the message list stays
+                # valid (the model expects a result for every tool_call_id),
+                # then signal the caller to abort the loop.
+                render_info(f"⊘  Cancelled — skipping {name} and all remaining tools.")
+                updated.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": "Tool execution cancelled by user.",
+                })
+                # Fill refusals for any tools we haven't reached yet.
+                remaining = tool_calls[tool_calls.index(tc) + 1:]
+                for remaining_tc in remaining:
+                    updated.append({
+                        "role": "tool",
+                        "tool_call_id": remaining_tc["id"],
+                        "content": "Tool execution cancelled by user.",
+                    })
+                return updated, True
+
+            if choice is ToolChoice.DENY:
+                render_info(f"⊘  Denied — skipping {name}.")
+                updated.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": "Tool call denied by user.",
+                })
+                continue
+
+            # ── Allow — execute the tool ──────────────────────────────────────
             try:
-                args: dict[str, Any] = json.loads(fn.get("arguments", "{}"))
+                args: dict[str, Any] = json.loads(raw_args or "{}")
             except json.JSONDecodeError:
                 args = {}
-            render_tool_call(name, fn.get("arguments", ""))
+
+            render_tool_call(name, raw_args)
             result = await self._mcp.call_tool(name, args)  # type: ignore[union-attr]
             render_tool_result(name, result)
             updated.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-        return updated
+
+        return updated, False
 
     # ── History helpers ───────────────────────────────────────────────────────
 

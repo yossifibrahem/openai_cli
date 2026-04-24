@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import asynccontextmanager, contextmanager
+from enum import Enum
 from typing import AsyncIterator, Generator
 
 from rich.live import Live
@@ -37,6 +38,16 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from .utils import console   # ← shared singleton; never create Console() here
+
+
+# ── Tool confirmation ─────────────────────────────────────────────────────────
+
+
+class ToolChoice(str, Enum):
+    """Result of the per-tool confirmation prompt."""
+    ALLOW  = "allow"   # execute this tool
+    DENY   = "deny"    # skip this tool, return a refusal result
+    CANCEL = "cancel"  # skip this tool *and* all remaining tools
 
 
 # ── Terminal helpers ──────────────────────────────────────────────────────────
@@ -248,6 +259,70 @@ class StreamingRenderer:
 
 # ── Non-streaming helpers — all use the shared console ───────────────────────
 
+
+async def confirm_tool_call(name: str, args: str) -> ToolChoice:
+    """Render a tool-call panel and wait for a single keypress: A / D / C.
+
+    * **A** (or Enter)        — Allow: proceed with execution.
+    * **D**                   — Deny: skip this tool; model receives a refusal.
+    * **C** (or Esc / Ctrl-C) — Cancel: abort this and all remaining tools.
+
+    No Enter required — the choice registers the moment the key is pressed.
+    """
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.key_binding import KeyBindings
+
+    preview = args[:400] + ("..." if len(args) > 400 else "")
+    console.print(
+        Panel(
+            f"[bold]{name}[/bold]\n[dim]{preview}[/dim]",
+            title="[yellow]Tool Call - Confirmation Required[/yellow]",
+            border_style="yellow",
+            expand=False,
+        )
+    )
+    console.print(
+        "  [bold green][A]llow[/bold green]"
+        "  [bold red][D]eny[/bold red]"
+        "  [bold dim][C]ancel all[/bold dim]"
+    )
+
+    kb: KeyBindings = KeyBindings()
+
+    @kb.add("a")
+    @kb.add("A")
+    @kb.add("enter")
+    def _allow(event) -> None:
+        event.app.exit(result=ToolChoice.ALLOW)
+
+    @kb.add("d")
+    @kb.add("D")
+    def _deny(event) -> None:
+        event.app.exit(result=ToolChoice.DENY)
+
+    @kb.add("c")
+    @kb.add("C")
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event) -> None:
+        event.app.exit(result=ToolChoice.CANCEL)
+
+    session: PromptSession = PromptSession(key_bindings=kb)
+    try:
+        choice = await session.prompt_async("  > ")
+    except (EOFError, KeyboardInterrupt):
+        choice = ToolChoice.CANCEL
+
+    if not isinstance(choice, ToolChoice):
+        choice = ToolChoice.ALLOW  # safety fallback
+
+    _LABELS = {
+        ToolChoice.ALLOW:  "[green]Allowed[/green]",
+        ToolChoice.DENY:   "[red]Denied[/red]",
+        ToolChoice.CANCEL: "[dim]Cancelled[/dim]",
+    }
+    console.print(f"  {_LABELS[choice]}\n")
+    return choice
 
 def render_tool_call(name: str, args: str) -> None:
     console.print(
