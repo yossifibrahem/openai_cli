@@ -1,47 +1,34 @@
 """Streaming markdown renderer using Rich.
 
-Design rules that prevent text duplication:
+Four rules prevent text duplication:
 
-1. A single shared ``Console`` instance (imported from ``.utils``) is used
-   everywhere.  Multiple ``Console()`` instances writing to the same stdout
-   bypass Rich's Live cursor-management and cause double-printing.
+1. One shared ``Console`` (from ``.utils``) — multiple instances bypass
+   Rich's cursor management and cause double-printing.
 
-2. The "thinking" spinner is the *initial renderable* of the ``Live`` session
-   itself — not a separate ``console.status`` call.  Starting two sequential
-   ``Live`` sessions (status uses Live internally) on the same console leaves
+2. The thinking spinner is the *initial renderable* of the ``Live`` session,
+   never a separate ``console.status`` — two sequential Live sessions leave
    the cursor in an unpredictable position.
 
-3. **Incremental block-commit rendering** eliminates the duplication bug:
+3. Incremental block-commit rendering — complete Markdown blocks are printed
+   permanently above the Live area via ``console.print()``; the Live area
+   shows only the current in-progress block.  Rich can always compute its
+   exact line-count so cursor-up always lands correctly.  ``transient=True``
+   clears the live area on exit; the remainder is printed once as Markdown.
 
-   The root cause of the duplication bug is that re-rendering the entire
-   response buffer as a single ``Markdown`` object inside a Rich ``Live``
-   session causes the live area to grow unboundedly.  Rich tracks cursor
-   position by computing the rendered line-count of the previous update and
-   issuing cursor-up escape codes to overwrite it.  When the rendered
-   content exceeds the terminal height, cursor-up can only move to the top
-   of the visible screen — leaving old content partially intact — and the
-   new render is written below it, producing apparent duplication.
-
-   The fix:
-
-   a. As chunks arrive, scan the uncommitted portion of the buffer for
-      *complete* Markdown blocks: paragraphs ended by a blank line, or
-      code fences whose closing ``` has arrived.
-   b. When a complete block is found, commit it permanently via a normal
-      ``console.print()`` call (Rich renders this *above* the live area
-      without cursor gymnastics).  The committed position advances.
-   c. The Live area shows only the current *in-progress* block — always a
-      small, bounded slice of the response.  Rich can always compute its
-      line-count exactly, so cursor-up always lands correctly.
-   d. ``transient=True`` on ``Live`` ensures the in-progress area is fully
-      cleared when the context exits.  The uncommitted remainder is then
-      printed once as ``Markdown`` — a normal print, no cursor movement.
+4. Echo suppression — between ``prompt_async()`` calls the terminal is in
+   cooked mode (ECHO on), so keystrokes are echoed directly to stdout by the
+   OS, outside Rich's awareness.  The stray byte shifts the cursor, making
+   cursor-up land a row too low and leaving the previous line intact.
+   ``_no_echo()`` clears the ECHO flag for the Live session's lifetime.
+   Buffered keystrokes are preserved and handled correctly by prompt_toolkit
+   on the next prompt — no stdin drain needed or wanted.
 """
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+import sys
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncIterator, Generator
 
 from rich.live import Live
 from rich.markdown import Markdown
@@ -50,6 +37,48 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from .utils import console   # ← shared singleton; never create Console() here
+
+
+# ── Terminal helpers ──────────────────────────────────────────────────────────
+
+
+@contextmanager
+def _no_echo() -> Generator[None, None, None]:
+    """Suppress terminal echo for the lifetime of the Rich Live session.
+
+    In cooked mode (between prompt_toolkit prompts) the OS echoes keystrokes
+    directly to stdout, outside Rich's Console.  The stray byte shifts the
+    cursor so Rich's cursor-up lands a row too low, leaving the previous
+    live-area line intact — the duplication bug.
+
+    Buffered keystrokes are *not* drained on exit: the OS never retroactively
+    echoes already-buffered input, and prompt_toolkit reads them correctly
+    through its own raw-mode pipeline on the next prompt.
+
+    ``TCSADRAIN`` is used for both set and restore so Rich's in-flight escape
+    sequences land before the attribute change takes effect.
+
+    No-op on Windows (no ``termios``) and non-tty stdin.
+    """
+    try:
+        import termios
+    except ImportError:
+        yield
+        return
+
+    if not sys.stdin.isatty():
+        yield
+        return
+
+    fd = sys.stdin.fileno()
+    old: list[int] = termios.tcgetattr(fd)
+    try:
+        new = termios.tcgetattr(fd)
+        new[3] &= ~termios.ECHO  # lflags — clear the ECHO bit only
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 # ── Streaming renderer ────────────────────────────────────────────────────────
@@ -72,12 +101,12 @@ class StreamingRenderer:
     ``console.print()``, which Rich handles without cursor gymnastics.
     """
 
-    def __init__(self, theme: str = "monokai", word_wrap: bool = True) -> None:
+    def __init__(self, theme: str = "monokai") -> None:
         self._theme = theme
-        self._word_wrap = word_wrap
         self._buffer = ""       # full accumulated response text
         self._commit_pos = 0    # bytes of _buffer already printed permanently
         self._live: Live | None = None
+        self._interrupted: bool = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -99,6 +128,19 @@ class StreamingRenderer:
         if pending.strip():
             self._live.update(Markdown(pending, code_theme=self._theme))
 
+    def mark_interrupted(self) -> None:
+        """Flush all pending content and flag the session as interrupted.
+
+        The caller should print a visual notice after the Live context exits.
+        """
+        self._interrupted = True
+        if self._live is not None:
+            # Treat a partial last line as complete before flushing.
+            if self._buffer and not self._buffer.endswith("\n"):
+                self._buffer += "\n"
+            self._flush_complete_blocks()
+            self._live.update(Text(""))  # clear the in-progress live area
+
     @asynccontextmanager
     async def live_display(
         self,
@@ -108,16 +150,14 @@ class StreamingRenderer:
     ) -> AsyncIterator["StreamingRenderer"]:
         """Async context manager owning the Rich Live session.
 
-        On entry:  shows a "thinking" spinner as the initial renderable so
-                   there is only ever one Live session active (no status+Live
-                   overlap).
-        On exit:   the live area (in-progress block) is cleared via
-                   ``transient=True``; the uncommitted remainder is then
-                   printed once as ``Markdown`` via a plain ``console.print``
-                   — no cursor gymnastics possible.
+        Shows a thinking spinner until the first chunk arrives, then streams
+        content with incremental block commits.  On exit the live area is
+        erased (``transient=True``) and the uncommitted remainder is printed
+        once as Markdown.
         """
         self._buffer = ""
         self._commit_pos = 0
+        self._interrupted = False
 
         initial_renderable = (
             Spinner("dots", text=Text(f" {model} is thinking…", style="dim italic"))
@@ -125,10 +165,9 @@ class StreamingRenderer:
             else Text("")
         )
 
-        # transient=True: Rich fully erases the live area when __exit__ is
-        # called.  Combined with incremental block commits above the live
-        # area, this guarantees that content is never double-printed.
-        with Live(
+        # _no_echo() suppresses OS keystroke echoes that would corrupt Rich's
+        # cursor tracking; see _no_echo() for the full rationale.
+        with _no_echo(), Live(
             initial_renderable,
             console=console,
             refresh_per_second=15,
@@ -141,8 +180,7 @@ class StreamingRenderer:
             finally:
                 self._live = None
 
-        # Live has cleared its area.  Print the uncommitted remainder (the
-        # last in-progress block, now complete) as Markdown exactly once.
+        # Print the last in-progress block now that it's complete.
         remainder = self._buffer[self._commit_pos:]
         if remainder.strip():
             console.print(Markdown(remainder, code_theme=self._theme))
@@ -169,17 +207,11 @@ class StreamingRenderer:
 
     @staticmethod
     def _find_commit_boundary(text: str) -> int:
-        """Return the index up to which *text* can be safely committed.
+        """Index up to which *text* can be safely committed.
 
-        A position is safe to commit when:
-        - It falls on a blank line *outside* any open code fence
-          (paragraph boundary), or
-        - It falls immediately after a line that closes an open code fence.
-
-        The last line of *text* is never included (it may be incomplete —
-        the stream may deliver the rest of it in the next chunk).
-
-        Returns 0 if no safe commit boundary exists yet.
+        Safe positions: a blank line outside any open code fence, or the line
+        that closes a code fence.  The last (possibly incomplete) line is
+        never included.  Returns 0 if no boundary exists yet.
         """
         if not text or "\n" not in text:
             return 0

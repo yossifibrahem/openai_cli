@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -14,6 +15,7 @@ from .models import ModelManager
 from .renderer import (
     StreamingRenderer,
     render_error,
+    render_info,
     render_separator,
     render_tool_call,
     render_tool_result,
@@ -186,20 +188,36 @@ class ChatSession:
     ) -> tuple[str, list[dict[str, Any]]]:
         assert self._client is not None
         tool_call_accumulator: dict[int, dict[str, Any]] = {}
+        interrupted = False
 
         async with self._renderer.live_display(self.model) as renderer:
             stream = await self._client.chat.completions.create(**kwargs, stream=True)
-            async for chunk in stream:
-                choice = chunk.choices[0] if chunk.choices else None
-                if choice is None:
-                    continue
-                delta = choice.delta
-                if delta.content:
-                    renderer.push(delta.content)
-                if delta.tool_calls:
-                    _accumulate_tool_calls(tool_call_accumulator, delta.tool_calls)
+            try:
+                async for chunk in stream:
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if choice is None:
+                        continue
+                    delta = choice.delta
+                    if delta.content:
+                        renderer.push(delta.content)
+                    if delta.tool_calls:
+                        _accumulate_tool_calls(tool_call_accumulator, delta.tool_calls)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # User pressed Ctrl-C mid-stream.  Flush whatever arrived and
+                # bail out cleanly — the Live context manager still runs its
+                # __exit__, printing the partial remainder via console.print().
+                interrupted = True
+                renderer.mark_interrupted()
 
-        tool_calls = list(tool_call_accumulator.values()) if tool_call_accumulator else []
+        if interrupted:
+            render_info("⚠  Response interrupted.")
+
+        # Skip tool calls when interrupted — executing them against a
+        # partial assistant message would produce incoherent results.
+        tool_calls = (
+            [] if interrupted
+            else (list(tool_call_accumulator.values()) if tool_call_accumulator else [])
+        )
         return renderer.text, tool_calls
 
     async def _execute_tool_calls(
