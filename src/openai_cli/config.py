@@ -111,8 +111,33 @@ def run_setup() -> Settings:
     url = console.input("Base URL [https://api.openai.com/v1]: ").strip()
     base_url = url or "https://api.openai.com/v1"
 
-    # Model
-    model = console.input("\nDefault model [gpt-4o]: ").strip() or "gpt-4o"
+    # Model — fetch then pick
+    import asyncio
+    from openai import AsyncOpenAI
+
+    models: list[str] = []
+    try:
+        with console.status("[cyan]Fetching models…[/cyan]"):
+            _client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            page = asyncio.run(_client.models.list())
+            models = sorted(m.id for m in page.data)
+    except Exception as exc:
+        console.print(f"[yellow]Could not fetch models: {exc}[/yellow]")
+
+    model = "gpt-4o"
+    if models:
+        console.print("\n[bold]Available models:[/bold]")
+        for i, m in enumerate(models[:15], 1):
+            console.print(f"  [{i}] {m}")
+        if len(models) > 15:
+            console.print(f"  [dim]… and {len(models) - 15} more[/dim]")
+        choice = console.input("\nPick a model [gpt-4o]: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            model = models[int(choice) - 1]
+        elif choice:
+            model = choice
+    else:
+        model = console.input("\nDefault model [gpt-4o]: ").strip() or "gpt-4o"
 
     settings = Settings(api_key=api_key, base_url=base_url, model=model)
     settings.save()
