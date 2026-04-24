@@ -32,8 +32,10 @@ MAX_TOOL_ROUNDS = 6
 CONTEXT_WINDOW = 20
 
 
-class Message(TypedDict, total=False):
+class _MessageRequired(TypedDict):
     role: str
+
+class Message(_MessageRequired, total=False):
     content: str | None
     tool_calls: list[dict[str, Any]]
     tool_call_id: str
@@ -103,25 +105,31 @@ class ChatSession:
 
         console.print(self._welcome_banner())
 
-        while True:
-            try:
-                user_input = await session.prompt_async(f"\n[{self.model}] You: ")
-            except (EOFError, KeyboardInterrupt):
-                console.print("\n[dim]Goodbye![/dim]")
-                break
-
-            user_input = user_input.strip()
-            if not user_input:
-                continue
-
-            if user_input.startswith("/"):
+        try:
+            while True:
                 try:
-                    await self._registry.execute(user_input, self)
-                except SystemExit:
+                    user_input = await session.prompt_async(f"\n[{self.model}] You: ")
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[dim]Goodbye![/dim]")
                     break
-                continue
 
-            await self.send_message(user_input)
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith("/"):
+                    try:
+                        await self._registry.execute(user_input, self)
+                    except SystemExit:
+                        break
+                    continue
+
+                await self.send_message(user_input)
+        finally:
+            # Always shut down MCP server processes/connections, even on
+            # Ctrl-C or an unhandled exception, so no subprocesses are orphaned.
+            if self._mcp:
+                await self._mcp.aclose()
 
     # ── Message sending ───────────────────────────────────────────────────────
 
@@ -181,7 +189,8 @@ class ChatSession:
             local_messages = await self._execute_tool_calls(local_messages, text, tool_calls)
             render_separator()
 
-        return ""
+        # MAX_TOOL_ROUNDS exhausted — return whatever the model last said.
+        return text
 
     async def _stream_response(
         self, kwargs: dict[str, Any]
@@ -202,7 +211,12 @@ class ChatSession:
                         renderer.push(delta.content)
                     if delta.tool_calls:
                         _accumulate_tool_calls(tool_call_accumulator, delta.tool_calls)
-            except (KeyboardInterrupt, asyncio.CancelledError):
+            except asyncio.CancelledError:
+                # Task was cancelled externally — flush partial output, then
+                # re-raise so the asyncio task system can shut down cleanly.
+                renderer.mark_interrupted()
+                raise
+            except KeyboardInterrupt:
                 # User pressed Ctrl-C mid-stream.  Flush whatever arrived and
                 # bail out cleanly — the Live context manager still runs its
                 # __exit__, printing the partial remainder via console.print().
@@ -248,8 +262,33 @@ class ChatSession:
     # ── History helpers ───────────────────────────────────────────────────────
 
     def _trim_history(self) -> None:
-        if len(self.history) > CONTEXT_WINDOW:
-            self.history = self.history[-CONTEXT_WINDOW:]
+        """Trim history to CONTEXT_WINDOW messages, but only at user-turn
+        boundaries.
+
+        Cutting inside a tool-call group (assistant message + one or more
+        tool-result messages) leaves orphaned ``tool_call_id`` entries with
+        no matching ``tool_calls`` on the assistant turn.  The API rejects
+        such histories.  We scan backwards to find the oldest user turn that
+        keeps the window within budget and slice there.
+        """
+        if len(self.history) <= CONTEXT_WINDOW:
+            return
+
+        # Walk forward and collect the index of each user-turn start.
+        user_turn_indices = [
+            i for i, m in enumerate(self.history) if m["role"] == "user"
+        ]
+
+        # Find the first user turn whose tail fits within the window.
+        for idx in user_turn_indices:
+            if len(self.history) - idx <= CONTEXT_WINDOW:
+                self.history = self.history[idx:]
+                return
+
+        # Fallback: keep the last CONTEXT_WINDOW messages (should not happen
+        # in normal use, but prevents unbounded growth if there are no user
+        # turns — e.g. a pure tool-call history).
+        self.history = self.history[-CONTEXT_WINDOW:]
 
     def _build_messages(self) -> list[Message]:
         return [{"role": "system", "content": self.settings.system_prompt}, *self.history]

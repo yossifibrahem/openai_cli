@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -64,14 +65,17 @@ def main() -> None:
         if args.setup:
             return
     else:
-        overrides = {
-            "api_key": args.api_key,
-            "base_url": args.base_url,
-            "model": args.model,
-            "system_prompt": args.system_prompt,
-            "mcp_file": args.mcp_file,
-            "no_mcp": args.no_mcp or None,
+        overrides: dict[str, Any] = {
+            k: v for k, v in {
+                "api_key": args.api_key,
+                "base_url": args.base_url,
+                "model": args.model,
+                "system_prompt": args.system_prompt,
+                "mcp_file": args.mcp_file,
+            }.items() if v is not None
         }
+        if args.no_mcp:
+            overrides["no_mcp"] = True
         try:
             settings = Settings.load(overrides)
         except SystemExit:

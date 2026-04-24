@@ -249,19 +249,6 @@ class StreamingRenderer:
 # ── Non-streaming helpers — all use the shared console ───────────────────────
 
 
-def render_message(role: str, content: str, theme: str = "monokai") -> None:
-    """Render a single message with role label."""
-    if role == "assistant":
-        label = "[bold cyan]Assistant[/bold cyan]"
-    elif role == "user":
-        label = "[bold green]You[/bold green]"
-    else:
-        label = f"[bold yellow]{role.title()}[/bold yellow]"
-
-    console.print(f"\n{label}")
-    console.print(Markdown(content, code_theme=theme))
-
-
 def render_tool_call(name: str, args: str) -> None:
     console.print(
         Panel(
@@ -291,12 +278,6 @@ def render_error(message: str) -> None:
 
 def render_info(message: str) -> None:
     console.print(f"[dim]{message}[/dim]")
-
-
-def render_token_usage(prompt: int, completion: int, total: int) -> None:
-    console.print(
-        f"\n[dim]Tokens — prompt: {prompt:,} · completion: {completion:,} · total: {total:,}[/dim]"
-    )
 
 
 def render_separator() -> None:

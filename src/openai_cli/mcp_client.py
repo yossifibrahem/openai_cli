@@ -7,6 +7,9 @@ Supported transports:
   • ``stdio``  — launch a local subprocess
   • ``sse``    — connect to an HTTP SSE endpoint
 
+To add a new transport, subclass ``Transport`` and register it in
+``_make_transport`` — no other code needs to change (OCP).
+
 mcp.json example::
 
     {
@@ -32,7 +35,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from abc import ABC, abstractmethod
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -72,21 +76,82 @@ class ServerConfig:
         self.env: dict[str, str] = {**os.environ, **raw.get("env", {})}
         self.enabled: bool = raw.get("enabled", True)
 
-    @property
-    def transport(self) -> str:
-        return "sse" if self.url else "stdio"
-
     def __repr__(self) -> str:
         if self.url:
             return f"ServerConfig(name={self.name!r}, url={self.url!r})"
         return f"ServerConfig(name={self.name!r}, command={self.command!r})"
 
 
+# ── Transport protocol (OCP) ──────────────────────────────────────────────────
+
+
+class Transport(ABC):
+    """Abstract transport.  Subclass to add new connection mechanisms without
+    modifying any existing code."""
+
+    @abstractmethod
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator["ClientSession"]:
+        """Yield a fully-initialised ``ClientSession``."""
+        ...  # pragma: no cover
+
+
+class StdioTransport(Transport):
+    """Spawns a local subprocess and communicates over stdin/stdout."""
+
+    def __init__(self, config: ServerConfig) -> None:
+        self._config = config
+
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator["ClientSession"]:
+        params = StdioServerParameters(
+            command=self._config.command,
+            args=self._config.args,
+            env=self._config.env,
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+
+class SSETransport(Transport):
+    """Connects to an HTTP Server-Sent Events endpoint."""
+
+    def __init__(self, config: ServerConfig) -> None:
+        self._config = config
+
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator["ClientSession"]:
+        async with sse_client(self._config.url) as (read, write):  # type: ignore[arg-type]
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+
+def _make_transport(config: ServerConfig) -> Transport:
+    """Return the correct ``Transport`` for *config*.
+
+    Add new transport types here — callers don't need to change.
+    """
+    if config.url:
+        return SSETransport(config)
+    return StdioTransport(config)
+
+
 # ── Main manager ──────────────────────────────────────────────────────────────
 
 
 class MCPManager:
-    """Manages a collection of MCP servers and their tools."""
+    """Manages a collection of MCP servers and their tools.
+
+    Sessions are kept alive for the lifetime of the manager (held open via
+    ``AsyncExitStack``) so every tool call reuses the existing connection
+    rather than spawning a new subprocess or HTTP session per call.
+
+    Call ``await manager.aclose()`` when the application exits to cleanly
+    shut down all server processes and connections.
+    """
 
     def __init__(self, mcp_file: Path, disabled: bool = False) -> None:
         self._mcp_file = mcp_file
@@ -94,12 +159,13 @@ class MCPManager:
         self._servers: dict[str, ServerConfig] = {}
         self._tools: list[dict[str, Any]] = []          # OpenAI-format tool defs
         self._tool_server_map: dict[str, str] = {}      # tool_name → server_name
-        self._loaded = False
+        self._sessions: dict[str, "ClientSession"] = {} # server_name → live session
+        self._exit_stack = AsyncExitStack()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        """Load mcp.json and discover tools from all enabled servers."""
+        """Load mcp.json, connect to all enabled servers, and discover tools."""
         if self._disabled:
             logger.debug("MCP disabled via --no-mcp")
             return
@@ -117,15 +183,19 @@ class MCPManager:
         enabled = {name: srv for name, srv in self._servers.items() if srv.enabled}
         logger.info("Loading tools from %d MCP server(s): %s", len(enabled), list(enabled))
 
+        await self._exit_stack.__aenter__()
         for name, server in enabled.items():
-            await self._load_server_tools(name, server)
+            await self._connect_server(name, server)
 
-        self._loaded = True
         if self._tools:
             logger.info("MCP: loaded %d tool(s) total", len(self._tools))
 
+    async def aclose(self) -> None:
+        """Shut down all server connections and processes cleanly."""
+        await self._exit_stack.aclose()
+
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Execute a named tool and return the result as a string."""
+        """Execute a named tool on its persistent session."""
         if not _MCP_AVAILABLE:
             return "Error: mcp package not installed."
 
@@ -133,13 +203,14 @@ class MCPManager:
         if not server_name:
             return f"Error: unknown tool {tool_name!r}"
 
-        server = self._servers[server_name]
-        logger.debug("Calling tool %r on server %r", tool_name, server_name)
+        session = self._sessions.get(server_name)
+        if session is None:
+            return f"Error: server {server_name!r} is not connected."
 
+        logger.debug("Calling tool %r on server %r", tool_name, server_name)
         try:
-            async with _server_session(server) as session:
-                result = await session.call_tool(tool_name, arguments)
-                return _extract_tool_result(result)
+            result = await session.call_tool(tool_name, arguments)
+            return _extract_tool_result(result)
         except Exception as exc:  # noqa: BLE001
             logger.error("Tool call failed: %s", exc)
             return f"Error calling {tool_name}: {exc}"
@@ -150,14 +221,6 @@ class MCPManager:
     def tools(self) -> list[dict[str, Any]]:
         """OpenAI-compatible tool definitions."""
         return self._tools
-
-    @property
-    def is_loaded(self) -> bool:
-        return self._loaded
-
-    @property
-    def server_count(self) -> int:
-        return len(self._servers)
 
     # ── Display ───────────────────────────────────────────────────────────────
 
@@ -175,11 +238,15 @@ class MCPManager:
         table.add_column("Status", justify="center")
 
         for name, srv in self._servers.items():
+            transport_name = "sse" if srv.url else "stdio"
             endpoint = srv.url or f"{srv.command} {' '.join(srv.args)}"
             tool_count = sum(1 for s in self._tool_server_map.values() if s == name)
-            status = "✓" if srv.enabled else "○"
+            connected = name in self._sessions
+            status = "✓" if connected else ("○" if srv.enabled else "–")
             row_style = "" if srv.enabled else "dim"
-            table.add_row(name, srv.transport, endpoint, str(tool_count), status, style=row_style)
+            table.add_row(
+                name, transport_name, endpoint, str(tool_count), status, style=row_style
+            )
 
         console.print(table)
 
@@ -204,13 +271,17 @@ class MCPManager:
             console.print(f"[yellow]Warning:[/yellow] Could not parse mcp.json: {exc}")
             return {}
 
-    async def _load_server_tools(self, name: str, server: ServerConfig) -> None:
-        """Connect to a server, list its tools, then disconnect."""
+    async def _connect_server(self, name: str, server: ServerConfig) -> None:
+        """Open a persistent session for *server* and register its tools."""
         try:
-            async with _server_session(server) as session:
-                result = await session.list_tools()
-                tools: list[MCPTool] = result.tools
+            transport = _make_transport(server)
+            session: ClientSession = await self._exit_stack.enter_async_context(
+                transport.connect()
+            )
+            result = await session.list_tools()
+            tools: list[MCPTool] = result.tools
 
+            self._sessions[name] = session
             for tool in tools:
                 self._tools.append(_mcp_tool_to_openai(tool))
                 self._tool_server_map[tool.name] = name
@@ -220,33 +291,6 @@ class MCPManager:
             console.print(
                 f"[yellow]Warning:[/yellow] MCP server [bold]{name}[/bold] unavailable: {exc}"
             )
-
-
-# ── Transport abstraction ─────────────────────────────────────────────────────
-
-
-@asynccontextmanager
-async def _server_session(server: ServerConfig) -> AsyncIterator["ClientSession"]:
-    """Open a short-lived MCP ClientSession for any supported transport.
-
-    Centralises stdio/SSE branching so callers never duplicate it.
-    Yields a fully-initialised ``ClientSession`` and cleans up on exit.
-    """
-    if server.transport == "sse":
-        async with sse_client(server.url) as (read, write):  # type: ignore[arg-type]
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
-    else:
-        params = StdioServerParameters(
-            command=server.command,
-            args=server.args,
-            env=server.env,
-        )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
 
 
 # ── Conversion helpers ────────────────────────────────────────────────────────

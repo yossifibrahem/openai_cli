@@ -9,13 +9,19 @@ Priority (highest → lowest):
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from openai import AsyncOpenAI
+
 from .utils import console
+
+logger = logging.getLogger(__name__)
 
 CONFIG_FILE = Path.home() / ".config" / "openai-cli" / "config.json"
 
@@ -52,8 +58,9 @@ class Settings:
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text())
-            except Exception:
-                pass
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Could not read config file %s: %s", CONFIG_FILE, exc)
+                console.print(f"[yellow]Warning:[/yellow] Could not read config file: {exc}")
 
         # Environment variables win over config file
         if key := os.environ.get("OPENAI_API_KEY"):
@@ -112,9 +119,6 @@ def run_setup() -> Settings:
     base_url = url or "https://api.openai.com/v1"
 
     # Model — fetch then pick
-    import asyncio
-    from openai import AsyncOpenAI
-
     models: list[str] = []
     try:
         with console.status("[cyan]Fetching models…[/cyan]"):
