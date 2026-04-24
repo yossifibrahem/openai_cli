@@ -3,3 +3,4 @@
 /.venv
 /src/openai_cli/__pycache__
 /mcp.json
+/src/openai_cli_chat.egg-info
