@@ -29,6 +29,11 @@ class Settings:
     mcp_file: Path = field(default_factory=lambda: Path.cwd() / "mcp.json")
     no_mcp: bool = False
 
+    def __post_init__(self) -> None:
+        # JSON and CLI args deliver these as plain strings; ensure Path types.
+        if not isinstance(self.mcp_file, Path):
+            self.mcp_file = Path(self.mcp_file)
+
     def save(self) -> None:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         data = {
