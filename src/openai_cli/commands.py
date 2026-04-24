@@ -1,17 +1,9 @@
-"""Slash command registry.
-
-Each command is a dataclass + async handler function.
-The registry is used both to execute commands and to feed the autocompleter.
-"""
+"""Slash command registry — /clear, /exit, /help, /mcp, /model, /models, /multi."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
 from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from rich.table import Table
@@ -21,33 +13,29 @@ from .utils import console
 if TYPE_CHECKING:
     from .chat import ChatSession
 
-logger = logging.getLogger(__name__)
-
 AsyncHandler = Callable[["CommandContext"], Coroutine[Any, Any, None]]
 
 
 @dataclass
 class SlashCommand:
-    name: str                       # e.g. "model"
+    name: str
     description: str
-    usage: str                      # e.g. "/model <name>"
+    usage: str
     handler: AsyncHandler
     aliases: list[str] = field(default_factory=list)
-    completer_choices: list[str] = field(default_factory=list)  # populated at runtime
+    completer_choices: list[str] = field(default_factory=list)
 
 
 @dataclass
 class CommandContext:
     session: "ChatSession"
-    args: str                       # everything after the command name
+    args: str
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 
 class CommandRegistry:
-    """Holds all registered slash commands."""
-
     def __init__(self) -> None:
         self._commands: dict[str, SlashCommand] = {}
 
@@ -60,7 +48,6 @@ class CommandRegistry:
         return self._commands.get(name.lstrip("/").split()[0].lower())
 
     def all_names(self) -> list[str]:
-        """Unique command names (excluding aliases that point to the same cmd)."""
         seen: set[str] = set()
         result: list[str] = []
         for cmd in self._commands.values():
@@ -78,8 +65,7 @@ class CommandRegistry:
                 result.append(cmd)
         return sorted(result, key=lambda c: c.name)
 
-    async def execute(self, raw: str, session: "ChatSession") -> bool:
-        """Parse and execute a slash command. Returns True if handled."""
+    async def execute(self, raw: str, session: "ChatSession") -> None:
         stripped = raw.lstrip("/").strip()
         parts = stripped.split(None, 1)
         name = parts[0].lower() if parts else ""
@@ -88,15 +74,15 @@ class CommandRegistry:
         cmd = self.get(name)
         if cmd is None:
             console.print(f"[red]Unknown command:[/red] /{name}  (try [bold]/help[/bold])")
-            return True
+            return
 
         ctx = CommandContext(session=session, args=args)
         try:
             await cmd.handler(ctx)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Command /%s failed", name)
+        except SystemExit:
+            raise
+        except Exception as exc:
             console.print(f"[red]Command error:[/red] {exc}")
-        return True
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -104,17 +90,27 @@ class CommandRegistry:
 
 async def _cmd_help(ctx: CommandContext) -> None:
     table = Table(title="Slash Commands", show_header=True, header_style="bold cyan")
-    table.add_column("Command", style="cyan", width=28)
+    table.add_column("Command", style="cyan", width=20)
     table.add_column("Description", style="white")
-
     for cmd in ctx.session.registry.all_commands():
-        alias_str = (
-            f"  [dim]({', '.join('/' + a for a in cmd.aliases)})[/dim]"
-            if cmd.aliases else ""
-        )
-        table.add_row(cmd.usage + alias_str, cmd.description)
-
+        aliases = f"  [dim]({', '.join('/' + a for a in cmd.aliases)})[/dim]" if cmd.aliases else ""
+        table.add_row(cmd.usage + aliases, cmd.description)
     console.print(table)
+
+
+async def _cmd_clear(ctx: CommandContext) -> None:
+    ctx.session.history.clear()
+    console.clear()
+    console.print(ctx.session._welcome_banner())
+
+
+async def _cmd_exit(ctx: CommandContext) -> None:
+    console.print("[dim]Goodbye![/dim]")
+    raise SystemExit(0)
+
+
+async def _cmd_mcp(ctx: CommandContext) -> None:
+    ctx.session.mcp_manager.display_servers()
 
 
 async def _cmd_model(ctx: CommandContext) -> None:
@@ -123,8 +119,7 @@ async def _cmd_model(ctx: CommandContext) -> None:
         console.print(f"Current model: [bold cyan]{session.model}[/bold cyan]")
         console.print("Usage: [bold]/model <name>[/bold] or [bold]/models[/bold] to list all")
         return
-
-    new_model = await session.model_manager.validate_model(ctx.args.strip())
+    new_model = ctx.args.strip()
     session.model = new_model
     console.print(f"[green]✓[/green] Switched to [bold cyan]{new_model}[/bold cyan]")
 
@@ -133,241 +128,13 @@ async def _cmd_models(ctx: CommandContext) -> None:
     await ctx.session.model_manager.list_and_display()
 
 
-async def _cmd_clear(ctx: CommandContext) -> None:
-    ctx.session.clear_history()
-    console.clear()
-    console.print(ctx.session._welcome_banner())
-
-
-async def _cmd_system(ctx: CommandContext) -> None:
-    if not ctx.args:
-        console.print(f"System prompt:\n[dim]{ctx.session.system_prompt}[/dim]")
-        return
-    ctx.session.system_prompt = ctx.args.strip()
-    ctx.session.clear_history()
-    console.print("[green]✓[/green] System prompt updated. History cleared.")
-
-
-async def _cmd_save(ctx: CommandContext) -> None:
-    session = ctx.session
-    if not session.history:
-        console.print("[yellow]Nothing to save.[/yellow]")
-        return
-
-    filename = ctx.args.strip() or f"chat_{datetime.now():%Y%m%d_%H%M%S}.json"
-    if not filename.endswith(".json"):
-        filename += ".json"
-
-    save_dir = session.settings.history_dir
-    save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = save_dir / filename
-
-    payload = {
-        "model": session.model,
-        "system_prompt": session.system_prompt,
-        "created_at": datetime.now().isoformat(),
-        "messages": session.history,
-    }
-    save_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    console.print(f"[green]✓[/green] Saved to [bold]{save_path}[/bold]")
-
-
-async def _cmd_load(ctx: CommandContext) -> None:
-    session = ctx.session
-    path_str = ctx.args.strip()
-
-    if not path_str:
-        history_dir = session.settings.history_dir
-        if not history_dir.exists():
-            console.print("[dim]No saved conversations.[/dim]")
-            return
-        files = sorted(
-            history_dir.glob("*.json"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not files:
-            console.print("[dim]No saved conversations.[/dim]")
-            return
-        console.print("[cyan]Saved conversations:[/cyan]")
-        for i, f in enumerate(files[:10], 1):
-            console.print(f"  {i}. [bold]{f.name}[/bold]  [dim]{f.stat().st_size // 1024}KB[/dim]")
-        return
-
-    # Accept absolute paths or names relative to history_dir.
-    path = Path(path_str)
-    if not path.is_absolute():
-        path = session.settings.history_dir / path_str
-
-    if not path.exists():
-        console.print(f"[red]File not found:[/red] {path}")
-        return
-
-    data: dict[str, Any] = json.loads(path.read_text())
-    session.model = data.get("model", session.model)
-    session.system_prompt = data.get("system_prompt", session.system_prompt)
-    session.history = data.get("messages", [])
-    console.print(
-        f"[green]✓[/green] Loaded [bold]{path.name}[/bold] "
-        f"({len(session.history)} messages, model: {session.model})"
-    )
-
-
-async def _cmd_history(ctx: CommandContext) -> None:
-    session = ctx.session
-    if not session.history:
-        console.print("[dim]No messages in history.[/dim]")
-        return
-
-    n = int(ctx.args.strip()) if ctx.args.strip().isdigit() else len(session.history)
-    recent = session.history[-n:]
-
-    for msg in recent:
-        role = msg["role"]
-        content = str(msg.get("content") or "")
-        if role == "assistant":
-            label = "[cyan]Assistant[/cyan]"
-        elif role == "user":
-            label = "[green]You[/green]"
-        else:
-            label = f"[yellow]{role.title()}[/yellow]"
-
-        snippet = content[:120].replace("\n", " ")
-        if len(content) > 120:
-            snippet += "…"
-        console.print(f"  {label}: {snippet}")
-
-    console.print(f"\n[dim]{len(session.history)} message(s) in context window[/dim]")
-
-
-async def _cmd_retry(ctx: CommandContext) -> None:
-    """Re-send the last user message."""
-    session = ctx.session
-    last_user = _find_last_user_message(session.history)
-    if last_user is None:
-        console.print("[yellow]No previous user message to retry.[/yellow]")
-        return
-
-    _strip_last_exchange(session.history)
-    console.print(f"[dim]Retrying: {last_user[:60]}…[/dim]")
-    await session.send_message(last_user, from_retry=True)
-
-
-def _find_last_user_message(history: list[dict[str, Any]]) -> str | None:
-    """Return the content of the last user message, or None."""
-    for msg in reversed(history):
-        if msg["role"] == "user":
-            return str(msg.get("content", ""))
-    return None
-
-
-def _strip_last_exchange(history: list[dict[str, Any]]) -> None:
-    """Remove the last user/assistant exchange from history in-place."""
-    if not history:
-        return
-    if history[-1]["role"] == "assistant":
-        history.pop()
-    if history and history[-1]["role"] == "user":
-        history.pop()
-
-
-async def _cmd_copy(ctx: CommandContext) -> None:
-    """Copy last assistant response to clipboard."""
-    for msg in reversed(ctx.session.history):
-        if msg["role"] == "assistant":
-            content = msg.get("content") or ""
-            try:
-                import pyperclip  # type: ignore[import-untyped]
-                pyperclip.copy(str(content))
-                console.print("[green]✓[/green] Copied to clipboard.")
-            except ImportError:
-                console.print("[yellow]pyperclip not installed.[/yellow]")
-            except Exception as exc:  # noqa: BLE001
-                console.print(f"[red]Could not copy:[/red] {exc}")
-            return
-    console.print("[yellow]No assistant message found.[/yellow]")
-
-
-async def _cmd_tokens(ctx: CommandContext) -> None:
-    session = ctx.session
-    console.print(
-        f"Total tokens used this session: [bold cyan]{session.total_tokens:,}[/bold cyan]\n"
-        f"Messages in context: [bold]{len(session.history)}[/bold] / "
-        f"[dim]{session.settings.context_window}[/dim]"
-    )
-
-
-async def _cmd_temp(ctx: CommandContext) -> None:
-    """View or set the sampling temperature for this session.
-
-    BUG FIX: previously wrote to ctx.session.temperature which did not exist
-    as an attribute on ChatSession, and _build_request_kwargs read from
-    self.settings.temperature (immutable).  ChatSession now exposes a
-    `temperature` instance attribute that _build_request_kwargs reads,
-    so this command actually takes effect.
-    """
-    if not ctx.args.strip():
-        value = ctx.session.temperature
-        display = str(value) if value is not None else "[dim]API default[/dim]"
-        console.print(f"Temperature: [bold]{display}[/bold]")
-        return
-    try:
-        val = float(ctx.args.strip())
-        if not 0.0 <= val <= 2.0:
-            raise ValueError("out of range")
-        ctx.session.temperature = val
-        console.print(f"[green]✓[/green] Temperature set to [bold]{val}[/bold]")
-    except ValueError:
-        console.print("[red]Temperature must be a float between 0.0 and 2.0[/red]")
-
-
-async def _cmd_mcp(ctx: CommandContext) -> None:
-    ctx.session.mcp_manager.display_servers()
-
-
-async def _cmd_export(ctx: CommandContext) -> None:
-    """Export conversation as Markdown."""
-    session = ctx.session
-    if not session.history:
-        console.print("[yellow]Nothing to export.[/yellow]")
-        return
-
-    filename = ctx.args.strip() or f"chat_{datetime.now():%Y%m%d_%H%M%S}.md"
-    if not filename.endswith(".md"):
-        filename += ".md"
-
-    lines = [
-        f"# Chat Export — {datetime.now():%Y-%m-%d %H:%M}\n",
-        f"**Model:** {session.model}\n\n",
-    ]
-    for msg in session.history:
-        role = msg["role"].title()
-        content = msg.get("content") or ""
-        lines.append(f"## {role}\n\n{content}\n\n---\n\n")
-
-    path = Path(filename)
-    path.write_text("".join(lines), encoding="utf-8")
-    console.print(f"[green]✓[/green] Exported to [bold]{path}[/bold]")
-
-
-async def _cmd_exit(ctx: CommandContext) -> None:
-    console.print("[dim]Goodbye![/dim]")
-    raise SystemExit(0)
-
-
-async def _read_line_async(prompt: str) -> str:
-    """Read a single line from stdin without blocking the event loop."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, input, prompt)
-
-
-async def _cmd_multiline(ctx: CommandContext) -> None:
-    """Enter multi-line input mode (end with a line containing only '.')."""
-    console.print("[dim]Multi-line mode: enter text, end with a single '.' on its own line.[/dim]")
+async def _cmd_multi(ctx: CommandContext) -> None:
+    console.print("[dim]Multi-line mode — end with a single '.' on its own line.[/dim]")
     lines: list[str] = []
+    loop = asyncio.get_running_loop()
     while True:
         try:
-            line = await _read_line_async("... ")
+            line = await loop.run_in_executor(None, input, "... ")
         except (EOFError, KeyboardInterrupt):
             break
         if line == ".":
@@ -381,32 +148,19 @@ async def _cmd_multiline(ctx: CommandContext) -> None:
         console.print("[dim]Empty input cancelled.[/dim]")
 
 
-# ── Build default registry ────────────────────────────────────────────────────
+# ── Build registry ────────────────────────────────────────────────────────────
 
 
 def build_registry() -> CommandRegistry:
     registry = CommandRegistry()
-
-    commands: list[SlashCommand] = [
-        SlashCommand("help",    "Show all available commands",              "/help",                _cmd_help,       aliases=["?"]),
-        SlashCommand("model",   "Switch to a different model",              "/model [name]",        _cmd_model),
-        SlashCommand("models",  "List all available models",                "/models",              _cmd_models),
-        SlashCommand("clear",   "Clear conversation history",               "/clear",               _cmd_clear,      aliases=["reset"]),
-        SlashCommand("system",  "View or set the system prompt",            "/system [prompt]",     _cmd_system),
-        SlashCommand("save",    "Save conversation to JSON",                "/save [filename]",     _cmd_save),
-        SlashCommand("load",    "Load a saved conversation",                "/load [filename]",     _cmd_load),
-        SlashCommand("history", "Show recent conversation history",         "/history [n]",         _cmd_history,    aliases=["h"]),
-        SlashCommand("retry",   "Retry the last message",                   "/retry",               _cmd_retry),
-        SlashCommand("copy",    "Copy last response to clipboard",          "/copy",                _cmd_copy),
-        SlashCommand("tokens",  "Show token usage for this session",        "/tokens",              _cmd_tokens),
-        SlashCommand("temp",    "View or set temperature",                  "/temp [value]",        _cmd_temp),
-        SlashCommand("mcp",     "Show MCP servers and tools",               "/mcp",                 _cmd_mcp),
-        SlashCommand("export",  "Export conversation as Markdown",          "/export [filename]",   _cmd_export),
-        SlashCommand("multi",   "Enter multi-line input mode",              "/multi",               _cmd_multiline,  aliases=["ml"]),
-        SlashCommand("exit",    "Exit the application",                     "/exit",                _cmd_exit,       aliases=["quit", "q"]),
-    ]
-
-    for cmd in commands:
+    for cmd in [
+        SlashCommand("clear",  "Clear conversation history",      "/clear",        _cmd_clear,  aliases=["reset"]),
+        SlashCommand("exit",   "Exit the application",            "/exit",         _cmd_exit,   aliases=["quit", "q"]),
+        SlashCommand("help",   "Show all available commands",     "/help",         _cmd_help,   aliases=["?"]),
+        SlashCommand("mcp",    "Show MCP servers and tools",      "/mcp",          _cmd_mcp),
+        SlashCommand("model",  "View or switch model",            "/model [name]", _cmd_model),
+        SlashCommand("models", "List all available models",       "/models",       _cmd_models),
+        SlashCommand("multi",  "Enter multi-line input mode",     "/multi",        _cmd_multi,  aliases=["ml"]),
+    ]:
         registry.register(cmd)
-
     return registry

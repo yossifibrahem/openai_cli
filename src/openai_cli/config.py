@@ -1,192 +1,115 @@
-"""Configuration management.
+"""Configuration — load from file, env vars, and CLI args.
 
 Priority (highest → lowest):
   1. CLI arguments
-  2. Environment variables (OPENAI_* or AI_*)
-  3. Config file (~/.config/openai-cli/config.json)
+  2. Environment variables (OPENAI_API_KEY / AI_*)
+  3. Config file  (~/.config/openai-cli/config.json)
   4. Hard-coded defaults
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
 from .utils import console
 
-logger = logging.getLogger(__name__)
-
-DEFAULT_CONFIG_DIR = Path.home() / ".config" / "openai-cli"
-DEFAULT_CONFIG_FILE = DEFAULT_CONFIG_DIR / "config.json"
-DEFAULT_MCP_FILE = Path.cwd() / "mcp.json"
-
-# Single source of truth — imported by wizard.py to avoid drift.
-AVAILABLE_THEMES: list[str] = ["monokai", "dracula", "github-dark", "one-dark", "solarized-dark"]
+CONFIG_FILE = Path.home() / ".config" / "openai-cli" / "config.json"
 
 
-class Settings(BaseSettings):
-    """Application settings loaded from env, config file, and CLI args."""
+@dataclass
+class Settings:
+    api_key: str | None = None
+    base_url: str = "https://api.openai.com/v1"
+    model: str = "gpt-4o"
+    system_prompt: str = "You are a helpful assistant."
+    mcp_file: Path = field(default_factory=lambda: Path.cwd() / "mcp.json")
+    no_mcp: bool = False
 
-    model_config = SettingsConfigDict(
-        env_prefix="AI_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
-    # ── API connection ───────────────────────────────────────────────────────
-    api_key: str | None = Field(default=None)
-    base_url: str = Field(default="https://api.openai.com/v1")
-    timeout: float = Field(default=60.0, ge=1.0, le=600.0)
-    max_retries: int = Field(default=2, ge=0, le=5)
-
-    # ── Model defaults ───────────────────────────────────────────────────────
-    # Sentinel defaults: None = use API server model defaults
-    model: str = Field(default="gpt-4o")
-    temperature: float | None = Field(default=None)
-    max_tokens: int | None = Field(default=None)
-    top_p: float | None = Field(default=None)
-    presence_penalty: float | None = Field(default=None)
-    frequency_penalty: float | None = Field(default=None)
-
-    # ── Chat behaviour ───────────────────────────────────────────────────────
-    system_prompt: str = Field(default="You are a helpful assistant.")
-    stream: bool = Field(default=True)
-    context_window: int = Field(default=20, ge=1, le=200, description="Max messages to keep in history")
-    save_history: bool = Field(default=True)
-
-    # ── Appearance ───────────────────────────────────────────────────────────
-    theme: str = Field(default="monokai")
-    show_token_usage: bool = Field(default=True)
-    show_model_in_prompt: bool = Field(default=True)
-    word_wrap: bool = Field(default=True)
-
-    # ── Paths ────────────────────────────────────────────────────────────────
-    config_file: Path = Field(default=DEFAULT_CONFIG_FILE)
-    mcp_file: Path = Field(default=DEFAULT_MCP_FILE)
-    history_dir: Path = Field(default=DEFAULT_CONFIG_DIR / "history")
-    log_file: Path | None = Field(default=None)
-
-    # ── Runtime (not persisted) ──────────────────────────────────────────────
-    no_mcp: bool = Field(default=False)
-    log_level: str = Field(default="WARNING")
-
-    @field_validator("api_key", mode="before")
-    @classmethod
-    def _resolve_api_key(cls, v: Any) -> str | None:
-        """Also check OPENAI_API_KEY from environment."""
-        if not v:
-            return os.environ.get("OPENAI_API_KEY")
-        return v
-
-    @field_validator("theme")
-    @classmethod
-    def _validate_theme(cls, v: str) -> str:
-        if v not in AVAILABLE_THEMES:
-            logger.warning("Unknown theme %r, falling back to 'monokai'", v)
-            return "monokai"
-        return v
-
-    # BUG FIX: the previous version included `config_file` (a runtime path)
-    # and could silently exclude `False` booleans due to the truthy `v` check.
-    # Now we explicitly list fields that must NOT be persisted, and use
-    # `v is not None` as the only filter (empty strings and False are valid).
-    _RUNTIME_FIELDS: frozenset[str] = frozenset({"no_mcp", "log_level", "log_file", "config_file"})
-
-    def to_persist_dict(self) -> dict[str, Any]:
-        """Return only user-configurable fields for serialisation."""
-        return {
-            k: (str(v) if isinstance(v, Path) else v)
-            for k, v in self.model_dump().items()
-            if k not in self._RUNTIME_FIELDS and v is not None
+    def save(self) -> None:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
         }
+        CONFIG_FILE.write_text(json.dumps(data, indent=2))
 
+    @classmethod
+    def load(cls, overrides: dict[str, Any] | None = None) -> "Settings":
+        """Build Settings by merging config file + env vars + overrides."""
+        data: dict[str, Any] = {}
 
-# ── Loaders ──────────────────────────────────────────────────────────────────
+        if CONFIG_FILE.exists():
+            try:
+                data = json.loads(CONFIG_FILE.read_text())
+            except Exception:
+                pass
 
+        # Environment variables win over config file
+        if key := os.environ.get("OPENAI_API_KEY"):
+            data["api_key"] = key
+        for env_key, field_name in [
+            ("AI_MODEL", "model"),
+            ("AI_BASE_URL", "base_url"),
+            ("AI_SYSTEM_PROMPT", "system_prompt"),
+        ]:
+            if val := os.environ.get(env_key):
+                data[field_name] = val
 
-def _load_config_file(path: Path) -> dict[str, Any]:
-    """Load JSON config file; return empty dict if missing or malformed."""
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        logger.debug("Loaded config from %s", path)
-        return data
-    except json.JSONDecodeError as exc:
-        console.print(f"[yellow]Warning:[/yellow] Could not parse config file {path}: {exc}")
-        return {}
+        # CLI overrides win over everything
+        if overrides:
+            data.update({k: v for k, v in overrides.items() if v is not None})
 
+        settings = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
-# Maps argparse attribute names → Settings field names.
-# Only non-None namespace values are applied.
-_CLI_TO_SETTINGS: dict[str, str] = {
-    "model": "model",
-    "system": "system_prompt",
-    "temperature": "temperature",
-    "max_tokens": "max_tokens",
-    "base_url": "base_url",
-    "api_key": "api_key",
-    "timeout": "timeout",
-    "stream": "stream",          # populated by _normalize_stream_arg in main.py
-    "config_file": "config_file",
-    "mcp_file": "mcp_file",
-    "no_mcp": "no_mcp",
-    "log_level": "log_level",
-    "log_file": "log_file",
-}
+        if not settings.api_key:
+            console.print(
+                "[red]Error:[/red] No API key found.\n"
+                "Set [bold]OPENAI_API_KEY[/bold] or run [bold]ai --setup[/bold]."
+            )
+            raise SystemExit(1)
 
-
-def _args_to_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """Convert non-None CLI args to a settings override dict."""
-    return {
-        settings_key: getattr(args, arg_key)
-        for arg_key, settings_key in _CLI_TO_SETTINGS.items()
-        if getattr(args, arg_key, None) is not None
-    }
-
-
-def load_config(args: argparse.Namespace | None = None) -> Settings:
-    """Build Settings by merging file config + env + CLI overrides."""
-    config_file = DEFAULT_CONFIG_FILE
-    if args and getattr(args, "config_file", None):
-        config_file = Path(args.config_file)
-
-    file_data = _load_config_file(config_file)
-    cli_overrides = _args_to_overrides(args) if args else {}
-
-    # Merge: file_data is the base; CLI overrides win.
-    merged = {**file_data, **cli_overrides, "config_file": config_file}
-    settings = Settings(**merged)
-
-    if not settings.api_key:
-        console.print(
-            "[red]Error:[/red] No API key found.\n"
-            "Set [bold]OPENAI_API_KEY[/bold] environment variable or add "
-            "[bold]api_key[/bold] to your config file.\n"
-            f"Config file: [dim]{settings.config_file}[/dim]"
-        )
-        raise ValueError("Missing API key")
-
-    return settings
-
-
-def save_config(settings: Settings) -> None:
-    """Persist current settings to the config file."""
-    settings.config_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(settings.config_file, "w") as f:
-        json.dump(settings.to_persist_dict(), f, indent=2)
-    logger.debug("Config saved to %s", settings.config_file)
+        return settings
 
 
 def config_exists() -> bool:
-    """Check if a config file already exists."""
-    return DEFAULT_CONFIG_FILE.exists()
+    return CONFIG_FILE.exists()
+
+
+def run_setup() -> Settings:
+    """Interactive first-run setup wizard."""
+    console.print("[bold cyan]OpenAI CLI — Setup[/bold cyan]\n")
+
+    # API key
+    env_key = os.environ.get("OPENAI_API_KEY", "")
+    if env_key:
+        console.print(f"[dim]Found OPENAI_API_KEY in environment.[/dim]")
+        inp = console.input("Press Enter to keep it, or type a new one: ").strip()
+        api_key = inp or env_key
+    else:
+        console.print("Get your key at: [dim]https://platform.openai.com/api-keys[/dim]")
+        while True:
+            api_key = console.input("API key: ").strip()
+            if api_key:
+                break
+            console.print("[red]Cannot be empty.[/red]")
+
+    # Base URL
+    console.print("\n[bold]Base URL[/bold]  (Enter = OpenAI default)")
+    console.print("  [dim]https://api.openai.com/v1[/dim]  ← default")
+    console.print("  [dim]http://localhost:11434/v1[/dim]   ← Ollama")
+    url = console.input("Base URL [https://api.openai.com/v1]: ").strip()
+    base_url = url or "https://api.openai.com/v1"
+
+    # Model
+    model = console.input("\nDefault model [gpt-4o]: ").strip() or "gpt-4o"
+
+    settings = Settings(api_key=api_key, base_url=base_url, model=model)
+    settings.save()
+    console.print(f"\n[green]✓[/green] Saved to {CONFIG_FILE}\n")
+    return settings
