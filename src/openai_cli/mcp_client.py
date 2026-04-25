@@ -46,6 +46,11 @@ from .utils import console
 
 logger = logging.getLogger(__name__)
 
+# Set to True to let MCP subprocess stderr pass through to the terminal.
+# Useful when developing or debugging a server; should stay False in normal use
+# so that chatty servers (e.g. mcp-remote) don't pollute the UI.
+MCP_SUBPROCESS_STDERR: bool = False
+
 # ── Optional mcp import ───────────────────────────────────────────────────────
 try:
     from mcp import ClientSession, StdioServerParameters
@@ -97,7 +102,17 @@ class Transport(ABC):
 
 
 class StdioTransport(Transport):
-    """Spawns a local subprocess and communicates over stdin/stdout."""
+    """Spawns a local subprocess and communicates over stdin/stdout.
+
+    Subprocess stderr is suppressed by default (``MCP_SUBPROCESS_STDERR =
+    False``) so that debug chatter from servers like ``mcp-remote`` never
+    reaches the terminal.  Flip the constant to ``True`` at the top of this
+    module to let stderr through while developing or debugging a server.
+
+    The ``mcp`` library routes subprocess stderr through ``stdio_client``'s
+    ``errlog`` parameter (not through ``StdioServerParameters``), so that is
+    the correct place to apply suppression.
+    """
 
     def __init__(self, config: ServerConfig) -> None:
         self._config = config
@@ -109,10 +124,22 @@ class StdioTransport(Transport):
             args=self._config.args,
             env=self._config.env,
         )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
+        # errlog is where the mcp library sends subprocess stderr.
+        # Open /dev/null once for the lifetime of this connection so the
+        # server's debug output never reaches the terminal.
+        errlog = (
+            open(os.devnull, "w")
+            if not MCP_SUBPROCESS_STDERR
+            else None          # None → mcp defaults to sys.stderr
+        )
+        try:
+            async with stdio_client(params, errlog=errlog) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    yield session
+        finally:
+            if errlog is not None:
+                errlog.close()
 
 
 class SSETransport(Transport):
