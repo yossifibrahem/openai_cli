@@ -261,68 +261,109 @@ class StreamingRenderer:
 
 
 async def confirm_tool_call(name: str, args: str) -> ToolChoice:
-    """Render a tool-call panel and wait for a single keypress: A / D / C.
+    """Render a tool-call panel and present an arrow-key menu for confirmation.
 
-    * **A** (or Enter)        — Allow: proceed with execution.
-    * **D**                   — Deny: skip this tool; model receives a refusal.
-    * **C** (or Esc / Ctrl-C) — Cancel: abort this and all remaining tools.
+    Navigate with ↑ / ↓ (or k / j), confirm with Enter, or press Esc / Ctrl-C
+    to cancel immediately.
 
-    No Enter required — the choice registers the moment the key is pressed.
+    Options
+    -------
+    Allow      — execute this tool normally.
+    Deny       — skip this tool; the model receives a refusal result.
+    Cancel all — skip this tool *and* every remaining tool in the round.
     """
-    from prompt_toolkit import PromptSession
+    from prompt_toolkit import Application
+    from prompt_toolkit.formatted_text import FormattedText
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
 
+    # ── Tool preview panel (via Rich) ─────────────────────────────────────────
     preview = args[:400] + ("..." if len(args) > 400 else "")
     console.print(
         Panel(
             f"[bold]{name}[/bold]\n[dim]{preview}[/dim]",
-            title="[yellow]Tool Call - Confirmation Required[/yellow]",
+            title="[yellow]⚙ Tool Call — Confirmation Required[/yellow]",
             border_style="yellow",
             expand=False,
         )
     )
-    console.print(
-        "  [bold green][A]llow[/bold green]"
-        "  [bold red][D]eny[/bold red]"
-        "  [bold dim][C]ancel all[/bold dim]"
-    )
 
+    # ── Menu definition ───────────────────────────────────────────────────────
+    _OPTIONS: list[tuple[ToolChoice, str, str, str]] = [
+        # (value,              label,        style-selected,   style-normal)
+        (ToolChoice.ALLOW,  "  Allow",       "fg:ansigreen bold",  "fg:ansigreen"),
+        (ToolChoice.DENY,   "  Deny",        "fg:ansired bold",    "fg:ansired"),
+        (ToolChoice.CANCEL, "  Cancel all",  "fg:ansiwhite bold",  "fg:ansibrightblack"),
+    ]
+    _CURSOR = "❯"
+    _SPACER = " "
+
+    state: dict[str, int] = {"idx": 0}
+    result: list[ToolChoice] = [ToolChoice.CANCEL]
+
+    # ── Live renderer (called on every keypress redraw) ───────────────────────
+    def _render() -> FormattedText:
+        fragments: list[tuple[str, str]] = []
+        for i, (_, label, style_sel, style_norm) in enumerate(_OPTIONS):
+            active = i == state["idx"]
+            cursor = _CURSOR if active else _SPACER
+            style  = style_sel if active else style_norm
+            fragments.append((style, f" {cursor}{label}\n"))
+        fragments.append(("italic ansibrightblack", "\n  ↑↓ to move  ·  Enter to select  ·  Esc to cancel\n"))
+        return FormattedText(fragments)
+
+    # ── Key bindings ──────────────────────────────────────────────────────────
     kb: KeyBindings = KeyBindings()
 
-    @kb.add("a")
-    @kb.add("A")
+    @kb.add("up")
+    @kb.add("k")
+    def _up(event) -> None:
+        state["idx"] = (state["idx"] - 1) % len(_OPTIONS)
+
+    @kb.add("down")
+    @kb.add("j")
+    def _down(event) -> None:
+        state["idx"] = (state["idx"] + 1) % len(_OPTIONS)
+
     @kb.add("enter")
-    def _allow(event) -> None:
-        event.app.exit(result=ToolChoice.ALLOW)
+    def _select(event) -> None:
+        result[0] = _OPTIONS[state["idx"]][0]
+        event.app.exit()
 
-    @kb.add("d")
-    @kb.add("D")
-    def _deny(event) -> None:
-        event.app.exit(result=ToolChoice.DENY)
-
-    @kb.add("c")
-    @kb.add("C")
     @kb.add("escape")
     @kb.add("c-c")
-    def _cancel(event) -> None:
-        event.app.exit(result=ToolChoice.CANCEL)
+    def _abort(event) -> None:
+        result[0] = ToolChoice.CANCEL
+        event.app.exit()
 
-    session: PromptSession = PromptSession(key_bindings=kb)
+    # ── Run the interactive menu ──────────────────────────────────────────────
+    app: Application[None] = Application(
+        layout=Layout(
+            Window(
+                content=FormattedTextControl(_render, focusable=True),
+                dont_extend_height=True,
+            )
+        ),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+        erase_when_done=True,   # wipe the menu lines after selection
+    )
     try:
-        choice = await session.prompt_async("  > ")
+        await app.run_async()
     except (EOFError, KeyboardInterrupt):
-        choice = ToolChoice.CANCEL
+        result[0] = ToolChoice.CANCEL
 
-    if not isinstance(choice, ToolChoice):
-        choice = ToolChoice.ALLOW  # safety fallback
-
+    # ── Print the resolved choice for the scrollback record ──────────────────
     _LABELS = {
-        ToolChoice.ALLOW:  "[green]Allowed[/green]",
-        ToolChoice.DENY:   "[red]Denied[/red]",
-        ToolChoice.CANCEL: "[dim]Cancelled[/dim]",
+        ToolChoice.ALLOW:  "[green]✔ Allowed[/green]",
+        ToolChoice.DENY:   "[red]✖ Denied[/red]",
+        ToolChoice.CANCEL: "[dim]⊘ Cancelled[/dim]",
     }
-    console.print(f"  {_LABELS[choice]}\n")
-    return choice
+    console.print(f"  {_LABELS[result[0]]}\n")
+    return result[0]
 
 def render_tool_call(name: str, args: str) -> None:
     console.print(
